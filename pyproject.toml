@@ -192,16 +192,29 @@ CANN = "CANN"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
-# torch pins nvidia-cudnn-cu13 to an exact version (==9.20.0.48 for torch 2.13.0),
-# so pip cannot upgrade cuDNN without hitting a ResolutionImpossible. Override it
-# here to pick up cuDNN fixes ahead of the next torch release.
+# torch pins nvidia-cudnn-cu1x to an exact version (==9.20.0.48 for torch 2.13.0 on
+# PyPI), so pip cannot upgrade cuDNN without hitting a ResolutionImpossible. Override
+# it here to pick up cuDNN fixes ahead of the next torch release.
 #
-# Only ever override *upwards*: cuDNN 9.x keeps SONAME libcudnn.so.9 and guarantees
-# minor-version backward binary compatibility, so a torch built against 9.20 runs
-# fine on 9.24. Downgrading below torch's pin is not covered by that guarantee.
-# torch resolves the library with a version-agnostic glob (libcudnn.so.*[0-9]) under
-# site-packages/nvidia/cudnn/lib, so no rebuild is needed. Keep the CUDA major in
-# sync with the torch build (cu13 for torch 2.13.0) -- a cu12 wheel would install
-# alongside rather than replace, and the glob would pick up whichever comes first.
-# Revisit this pin whenever torch is bumped, in case torch catches up or overtakes.
-override-dependencies = ["nvidia-cudnn-cu13==9.24.0.43"]
+# Both CUDA majors are listed because the right one depends on where torch came from:
+# the PyPI wheels for torch 2.13.0 are cu13, while a torch installed from a cu12 index
+# (download.pytorch.org/whl/cu12x) depends on nvidia-cudnn-cu12 instead. An override
+# only applies to a package that is already in the resolution -- it does not pull one
+# in -- so the entry for the unused CUDA major is inert rather than harmful, and the
+# same file works for either toolchain.
+#
+# A floor rather than an exact pin, so this never silently becomes a downgrade when
+# torch bumps its own cuDNN pin past this version. cuDNN 9.x keeps SONAME
+# libcudnn.so.9 and guarantees minor-version backward binary compatibility, so a torch
+# built against 9.20 runs fine on any later 9.x; the <10 cap stops a future major from
+# breaking that. No rebuild is needed -- torch resolves the library with a
+# version-agnostic glob (libcudnn.so.*[0-9]) under site-packages/nvidia/cudnn/lib.
+#
+# The markers are load-bearing: a uv override replaces the *entire* requirement,
+# markers included, so dropping them forces cuDNN onto platforms torch never asked for
+# (a ~350MB no-op wheel on Windows, and an unsatisfiable resolution on macOS, where no
+# cuDNN wheel exists at all).
+override-dependencies = [
+    "nvidia-cudnn-cu12>=9.24.0.43,<10; platform_system == 'Linux'",
+    "nvidia-cudnn-cu13>=9.24.0.43,<10; platform_system == 'Linux'",
+]
