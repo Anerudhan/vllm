@@ -59,7 +59,11 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.utils.flashinfer import flashinfer_cudnn_gdn, has_flashinfer_cudnn_gdn
+from vllm.utils.flashinfer import (
+    flashinfer_cudnn_gdn,
+    has_flashinfer_cudnn_gdn,
+    has_flashinfer_gdn_max_seqlen,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -236,6 +240,8 @@ def fi_chunk_gated_delta_rule(
         if backend == "cudnn"
         else {"backend": "flashinfer"}
     )
+    if backend == "flashinfer" and has_flashinfer_gdn_max_seqlen():
+        backend_kwargs["max_seqlen"] = q.shape[0]
     result = prefill(
         q=q,
         k=k,

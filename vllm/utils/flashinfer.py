@@ -474,6 +474,20 @@ def has_flashinfer_bf16_fp4() -> bool:
 
 
 @functools.cache
+def has_flashinfer_gdn_max_seqlen() -> bool:
+    if not has_flashinfer():
+        return False
+    try:
+        import inspect
+
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        return "max_seqlen" in inspect.signature(chunk_gated_delta_rule).parameters
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
 def _has_flashinfer_cudnn_linear_attention(name: str) -> bool:
     if not has_flashinfer():
         return False
@@ -1357,6 +1371,7 @@ __all__ = [
     "has_flashinfer_fused_kda_decode",
     "has_flashinfer_cudnn_gdn",
     "has_flashinfer_cudnn_kda",
+    "has_flashinfer_gdn_max_seqlen",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",

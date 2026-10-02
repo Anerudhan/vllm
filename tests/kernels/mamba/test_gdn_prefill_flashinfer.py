@@ -21,7 +21,17 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.third_party.flash_linear_attention.ops import (  # noqa: E402
     chunk_gated_delta_rule,
 )
-from vllm.utils.flashinfer import has_flashinfer_cudnn_gdn  # noqa: E402
+from vllm.utils.flashinfer import (  # noqa: E402
+    has_flashinfer_cudnn_gdn,
+    has_flashinfer_gdn_max_seqlen,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_flashinfer_gdn_signature_cache():
+    has_flashinfer_gdn_max_seqlen.cache_clear()
+    yield
+    has_flashinfer_gdn_max_seqlen.cache_clear()
 
 
 @pytest.mark.parametrize("backend", ["flashinfer", "cudnn"])
@@ -31,11 +41,23 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
 ):
     captured = {}
 
-    def fake_chunk_gated_delta_rule(**kwargs):
-        captured.update(kwargs)
-        if kwargs["output_final_state"]:
-            return kwargs["q"], kwargs["initial_state"].clone()
-        return kwargs["q"]
+    def fake_chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        output_final_state,
+        cu_seqlens,
+        *,
+        backend="flashinfer",
+        batch_invariant=False,
+    ):
+        captured.update(locals())
+        if output_final_state:
+            return q, initial_state.clone()
+        return q
 
     if backend == "cudnn":
         monkeypatch.setattr(
@@ -85,19 +107,32 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
             or current_platform.is_device_capability(103)
         )
     ),
-    reason="cuDNN GDN prefill requires CUDA SM100/SM103",
+    reason="Blackwell GDN prefill requires CUDA SM100/SM103",
 )
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("num_v_heads,normalize_qk", [(2, True), (4, False)])
+@pytest.mark.parametrize(
+    "num_tokens,num_k_heads,num_v_heads,normalize_qk,backend",
+    [
+        (145, 2, 2, True, "cudnn"),
+        (145, 2, 4, False, "cudnn"),
+        (2048, 8, 16, True, "flashinfer"),
+        (8192, 8, 16, False, "flashinfer"),
+    ],
+)
 @torch.inference_mode()
-def test_cudnn_gdn_prefill_matches_fla_with_graph_and_initial_state(
-    state_dtype: torch.dtype, num_v_heads: int, normalize_qk: bool
+def test_flashinfer_gdn_prefill_matches_fla_and_replays_ragged_graph(
+    state_dtype: torch.dtype,
+    num_tokens: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    normalize_qk: bool,
+    backend: str,
 ):
-    if not has_flashinfer_cudnn_gdn():
+    if backend == "cudnn" and not has_flashinfer_cudnn_gdn():
         pytest.skip("FlashInfer cuDNN GDN prefill is unavailable")
 
     torch.manual_seed(42)
-    num_tokens, num_k_heads, head_dim = 145, 2, 128
+    head_dim = 128
     q, k = [
         torch.randn(
             1, num_tokens, num_k_heads, head_dim, device="cuda", dtype=torch.bfloat16
@@ -132,14 +167,20 @@ def test_cudnn_gdn_prefill_matches_fla_with_graph_and_initial_state(
         use_qk_l2norm_in_kernel=normalize_qk,
     )
     expected_out, expected_state = chunk_gated_delta_rule(**kwargs)
-    actual_out, actual_state = fi_chunk_gated_delta_rule(**kwargs, backend="cudnn")
+    actual_out, actual_state = fi_chunk_gated_delta_rule(**kwargs, backend=backend)
     torch.testing.assert_close(actual_out, expected_out, atol=2e-3, rtol=2e-2)
     torch.testing.assert_close(actual_state, expected_state, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(initial_state, state_before, atol=0, rtol=0)
 
+    kwargs["cu_seqlens"][1] = num_tokens // 2
+    fi_chunk_gated_delta_rule(**kwargs, backend=backend)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_out, graph_state = fi_chunk_gated_delta_rule(**kwargs, backend="cudnn")
+        graph_out, graph_state = fi_chunk_gated_delta_rule(**kwargs, backend=backend)
+    kwargs["cu_seqlens"][1] = num_tokens - 17
+    reference_kwargs = kwargs | {"cu_seqlens": kwargs["cu_seqlens"].clone()}
+    expected_out, expected_state = chunk_gated_delta_rule(**reference_kwargs)
     graph.replay()
-    torch.testing.assert_close(graph_out, actual_out, atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(graph_state, actual_state, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(graph_out, expected_out, atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(graph_state, expected_state, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(initial_state, state_before, atol=0, rtol=0)
