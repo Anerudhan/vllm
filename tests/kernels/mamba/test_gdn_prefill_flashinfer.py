@@ -23,22 +23,26 @@ from vllm.third_party.flash_linear_attention.ops import (  # noqa: E402
 from vllm.utils.flashinfer import (  # noqa: E402
     has_flashinfer_cudnn_gdn,
     has_flashinfer_gdn_max_seqlen,
+    resolve_flashinfer_gdn_backend,
 )
 
 
 @pytest.fixture(autouse=True)
-def reset_flashinfer_gdn_signature_cache():
+def reset_flashinfer_gdn_caches():
     has_flashinfer_gdn_max_seqlen.cache_clear()
+    resolve_flashinfer_gdn_backend.cache_clear()
     yield
     has_flashinfer_gdn_max_seqlen.cache_clear()
+    resolve_flashinfer_gdn_backend.cache_clear()
 
 
-@pytest.mark.parametrize("backend", ["flashinfer", "cudnn"])
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
 @pytest.mark.parametrize("output_final_state", [False, True])
 @pytest.mark.parametrize("batch_invariant", [False, True])
 def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
     monkeypatch, backend, output_final_state, batch_invariant
 ):
+    monkeypatch.setattr(flashinfer, "__version__", "0.7.1")
     captured = {}
 
     def fake_chunk_gated_delta_rule(
@@ -104,6 +108,45 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
         assert final_state is None
 
 
+@pytest.mark.parametrize("version", ["0.7.0.post1", "0.7.1"])
+def test_flashinfer_gdn_auto_preserves_native_dispatch(monkeypatch, version):
+    captured = {}
+    monkeypatch.setattr("vllm.utils.flashinfer.has_flashinfer", lambda: True)
+
+    def legacy_chunk(
+        q, k, v, g, beta, initial_state, output_final_state, cu_seqlens, *, backend
+    ):
+        captured["backend"] = backend
+        return q
+
+    def current_chunk(*args, max_seqlen, **kwargs):
+        captured["max_seqlen"] = max_seqlen
+        return legacy_chunk(*args, **kwargs)
+
+    monkeypatch.setattr(flashinfer, "__version__", version)
+    monkeypatch.setattr(
+        flashinfer.gdn_prefill,
+        "chunk_gated_delta_rule",
+        legacy_chunk if version == "0.7.0.post1" else current_chunk,
+    )
+    q = torch.zeros(1, 3, 1, 2, dtype=torch.bfloat16)
+    fi_chunk_gated_delta_rule(
+        q=q,
+        k=q,
+        v=q,
+        g=torch.zeros(1, 3, 1),
+        beta=torch.ones(1, 3, 1),
+        initial_state=torch.zeros(1, 1, 2, 2),
+        output_final_state=False,
+        cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
+        use_qk_l2norm_in_kernel=False,
+    )
+    if version == "0.7.0.post1":
+        assert captured == {"backend": "flashinfer"}
+    else:
+        assert captured == {"backend": "auto", "max_seqlen": 3}
+
+
 @pytest.mark.skipif(
     not (
         current_platform.is_cuda()
@@ -120,8 +163,8 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
     [
         (145, 2, 2, True, "cudnn"),
         (145, 2, 4, False, "cudnn"),
-        (2048, 8, 16, True, "flashinfer"),
-        (8192, 8, 16, False, "flashinfer"),
+        (2048, 8, 16, True, "auto"),
+        (8192, 8, 16, False, "auto"),
     ],
 )
 @torch.inference_mode()

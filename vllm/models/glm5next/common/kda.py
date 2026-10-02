@@ -33,9 +33,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.flashinfer_cudnn_kda import (
-    flashinfer_cudnn_kda_prefill,
-    validate_flashinfer_cudnn_kda_prefill,
+from vllm.model_executor.layers.mamba.ops.flashinfer_kda import (
+    flashinfer_kda_prefill,
+    validate_flashinfer_kda_prefill,
 )
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -144,9 +144,14 @@ def _resolve_kda_prefill_backend(
     dtype: torch.dtype,
     lower_bound: float | None,
     state_dtype: torch.dtype = torch.float32,
+    flashinfer_backend: str = "auto",
 ) -> str:
-    if backend == "flashinfer_cudnn":
-        validate_flashinfer_cudnn_kda_prefill(head_dim, dtype, state_dtype, lower_bound)
+    if backend == "flashinfer":
+        if flashinfer_backend != "cudnn":
+            raise ValueError("GLM FlashInfer KDA prefill requires backend=cudnn.")
+        validate_flashinfer_kda_prefill(
+            head_dim, dtype, state_dtype, lower_bound, backend=flashinfer_backend
+        )
         return backend
     if backend not in ("auto", "triton", "flashkda"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
@@ -346,6 +351,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self._conv_state_dim_first = is_conv_state_dim_first()
 
         additional_config = vllm_config.additional_config
+        self.flashinfer_kda_backend = (
+            additional_config.get("flashinfer_kda_backend", "auto")
+            if isinstance(additional_config, dict)
+            else "auto"
+        )
         self.kda_prefill_backend = _resolve_kda_prefill_backend(
             additional_config.get("kda_prefill_backend", "auto")
             if isinstance(additional_config, dict)
@@ -354,6 +364,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             self.kda_lower_bound,
             self.get_state_dtype()[1],
+            self.flashinfer_kda_backend,
         )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
@@ -722,7 +733,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     conv_state=conv_state,
                     recurrent_state=recurrent_state,
                 )
-            elif self.kda_prefill_backend == "flashinfer_cudnn":
+            elif self.kda_prefill_backend == "flashinfer":
                 if attn_metadata_narrowed.checkpoint is not None:
                     raise NotImplementedError(
                         "FlashInfer cuDNN KDA prefill does not support "
@@ -730,20 +741,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     )
                 assert non_spec_query_start_loc is not None
                 ns_out = None if use_spec else core_attn_out[:, :num_actual_tokens]
-                core_attn_out_non_spec, last_recurrent_state = (
-                    flashinfer_cudnn_kda_prefill(
-                        q=_rearr(q_ns),
-                        k=_rearr(k_ns),
-                        v=_rearr(v_ns),
-                        raw_g=g1_ns,
-                        raw_beta=beta_ns,
-                        A_log=self.A_log,
-                        dt_bias=self.dt_bias,
-                        lower_bound=lower_bound,
-                        initial_state=initial_state,
-                        cu_seqlens=non_spec_query_start_loc,
-                        out=ns_out,
-                    )
+                core_attn_out_non_spec, last_recurrent_state = flashinfer_kda_prefill(
+                    q=_rearr(q_ns),
+                    k=_rearr(k_ns),
+                    v=_rearr(v_ns),
+                    raw_g=g1_ns,
+                    raw_beta=beta_ns,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    lower_bound=lower_bound,
+                    initial_state=initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    out=ns_out,
+                    backend=self.flashinfer_kda_backend,
                 )
             else:
                 (

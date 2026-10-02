@@ -62,6 +62,7 @@ from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.utils.flashinfer import (
     has_flashinfer_cudnn_gdn,
     has_flashinfer_gdn_max_seqlen,
+    resolve_flashinfer_gdn_backend,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -94,10 +95,48 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _get_flashinfer_gdn_backend(
+    vllm_config: VllmConfig,
+) -> Literal["auto", "cudnn"]:
+    additional_config = vllm_config.additional_config
+    backend_cfg = (
+        additional_config.get("flashinfer_gdn_backend", "auto")
+        if isinstance(additional_config, dict)
+        else "auto"
+    )
+    backend = str(backend_cfg).strip().lower()
+    if backend not in ("auto", "cudnn"):
+        raise ValueError(f"Unsupported FlashInfer GDN backend: {backend}")
+    return "cudnn" if backend == "cudnn" else "auto"
+
+
+def _validate_cudnn_gdn_prefill(vllm_config: VllmConfig) -> None:
+    config = vllm_config.model_config
+    if not (
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability(100)
+            or current_platform.is_device_capability(103)
+        )
+        and config.dtype == torch.bfloat16
+        and getattr(config.hf_text_config, "linear_key_head_dim", None) == 128
+        and getattr(config.hf_text_config, "linear_value_head_dim", None) == 128
+    ):
+        raise ValueError(
+            "FlashInfer cuDNN GDN prefill requires CUDA SM100/SM103, "
+            "bfloat16 inputs, and key/value head dimensions of 128."
+        )
+    if not has_flashinfer_cudnn_gdn():
+        raise RuntimeError(
+            "FlashInfer cuDNN GDN prefill requires FlashInfer with cuDNN "
+            "linear attention and nvidia-cudnn-frontend[cutedsl]>=1.30.0."
+        )
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "flashinfer_cudnn", "cutedsl"]]:
-    """Resolve GDN prefill while keeping cuDNN and CuteDSL opt-in."""
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+    """Resolve the provider while keeping cuDNN and CuteDSL opt-in."""
     additional_config = vllm_config.additional_config
     backend_cfg = (
         additional_config.get("gdn_prefill_backend", "auto")
@@ -105,29 +144,12 @@ def _resolve_gdn_prefill_backend(
         else "auto"
     )
     backend = str(backend_cfg).strip().lower()
-
-    if backend == "flashinfer_cudnn":
-        config = vllm_config.model_config
-        if not (
-            current_platform.is_cuda()
-            and (
-                current_platform.is_device_capability(100)
-                or current_platform.is_device_capability(103)
-            )
-            and config.dtype == torch.bfloat16
-            and getattr(config.hf_text_config, "linear_key_head_dim", None) == 128
-            and getattr(config.hf_text_config, "linear_value_head_dim", None) == 128
-        ):
-            raise ValueError(
-                "FlashInfer cuDNN GDN prefill requires CUDA SM100/SM103, "
-                "bfloat16 inputs, and key/value head dimensions of 128."
-            )
-        if not has_flashinfer_cudnn_gdn():
-            raise RuntimeError(
-                "FlashInfer cuDNN GDN prefill requires FlashInfer with cuDNN "
-                "linear attention and nvidia-cudnn-frontend[cutedsl]>=1.30.0."
-            )
-        return backend, "flashinfer_cudnn"
+    flashinfer_backend = _get_flashinfer_gdn_backend(vllm_config)
+    if backend not in ("auto", "triton", "flashinfer", "cutedsl"):
+        raise ValueError(f"Unsupported GDN prefill backend: {backend}")
+    if backend == "flashinfer" and flashinfer_backend == "cudnn":
+        _validate_cudnn_gdn_prefill(vllm_config)
+        return backend, "flashinfer"
 
     if not current_platform.is_cuda():
         return backend, "triton"
@@ -157,6 +179,8 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
+        if flashinfer_backend == "cudnn":
+            _validate_cudnn_gdn_prefill(vllm_config)
         return backend, "flashinfer"
     if backend == "cutedsl" and supports_cutedsl:
         return backend, "cutedsl"
@@ -185,10 +209,14 @@ def _log_gdn_backend_decision(
 
     chosen = {
         "flashinfer": "FlashInfer",
-        "flashinfer_cudnn": "FlashInfer cuDNN",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
     }[active_backend]
+    if active_backend == "flashinfer":
+        backend = resolve_flashinfer_gdn_backend(
+            _get_flashinfer_gdn_backend(vllm_config)
+        )
+        chosen += f" ({backend})"
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
         chosen,
@@ -212,7 +240,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
-    backend: Literal["flashinfer", "cudnn"] = "flashinfer",
+    backend: Literal["auto", "flashinfer", "cudnn"] = "auto",
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -222,6 +250,7 @@ def fi_chunk_gated_delta_rule(
         raise NotImplementedError(
             "FlashInfer's GDN dispatcher does not expose batch_invariant."
         )
+    fi_backend = resolve_flashinfer_gdn_backend(backend)
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q)
@@ -239,7 +268,7 @@ def fi_chunk_gated_delta_rule(
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
     backend_kwargs = {}
-    if backend == "flashinfer" and has_flashinfer_gdn_max_seqlen():
+    if backend != "cudnn" and has_flashinfer_gdn_max_seqlen():
         backend_kwargs["max_seqlen"] = q.shape[0]
     result = chunk_gated_delta_rule_fi(
         q=q,
@@ -250,7 +279,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        backend=backend,
+        backend=fi_backend,
         **backend_kwargs,
     )
     if output_final_state:
@@ -267,6 +296,7 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        self.flashinfer_gdn_backend = _get_flashinfer_gdn_backend(vllm_config)
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
             logger.warning_once(
@@ -276,7 +306,7 @@ class ChunkGatedDeltaRule(CustomOp):
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
-        if active_backend in ("flashinfer", "flashinfer_cudnn"):
+        if active_backend == "flashinfer":
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
@@ -308,11 +338,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            backend=(
-                "cudnn"
-                if self.gdn_prefill_backend == "flashinfer_cudnn"
-                else "flashinfer"
-            ),
+            backend=self.flashinfer_gdn_backend,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -534,6 +560,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
+        self.flashinfer_gdn_backend = self.chunk_gated_delta_rule.flashinfer_gdn_backend
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -1172,7 +1199,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
         except Exception:
-            if self.gdn_prefill_backend == "flashinfer_cudnn":
+            if (
+                self.gdn_prefill_backend == "flashinfer"
+                and self.flashinfer_gdn_backend == "cudnn"
+            ):
                 raise
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "

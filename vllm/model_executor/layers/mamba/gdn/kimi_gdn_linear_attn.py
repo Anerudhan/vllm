@@ -38,9 +38,9 @@ from ..mamba_utils import (
     is_conv_state_dim_first,
 )
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-from ..ops.flashinfer_cudnn_kda import (
-    flashinfer_cudnn_kda_prefill,
-    validate_flashinfer_cudnn_kda_prefill,
+from ..ops.flashinfer_kda import (
+    flashinfer_kda_prefill,
+    validate_flashinfer_kda_prefill,
 )
 from ..ops.gather_initial_states import gather_initial_states
 
@@ -286,12 +286,22 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else "auto"
         )
         backend = "triton" if backend == "auto" else backend
-        if backend == "flashinfer_cudnn":
-            validate_flashinfer_cudnn_kda_prefill(
+        self.flashinfer_kda_backend = (
+            additional_config.get("flashinfer_kda_backend", "auto")
+            if isinstance(additional_config, dict)
+            else "auto"
+        )
+        if backend == "flashinfer":
+            if self.flashinfer_kda_backend != "cudnn":
+                raise ValueError(
+                    "Shared Kimi FlashInfer KDA prefill requires backend=cudnn."
+                )
+            validate_flashinfer_kda_prefill(
                 self.head_dim,
                 vllm_config.model_config.dtype,
                 self.get_state_dtype()[1],
                 self.gate_lower_bound,
+                backend=self.flashinfer_kda_backend,
             )
         elif backend != "triton":
             raise ValueError(f"Unsupported shared Kimi KDA prefill backend: {backend}")
@@ -578,7 +588,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     non_spec_state_indices_tensor,
                     has_initial_state,
                 )
-                if self.kda_prefill_backend == "flashinfer_cudnn":
+                if self.kda_prefill_backend == "flashinfer":
                     if m.checkpoint is not None:
                         raise NotImplementedError(
                             "FlashInfer cuDNN KDA prefill does not support "
@@ -588,7 +598,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
-                    ) = flashinfer_cudnn_kda_prefill(
+                    ) = flashinfer_kda_prefill(
                         q=q_ns,
                         k=k_ns,
                         v=v_ns,
@@ -599,6 +609,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         lower_bound=self.gate_lower_bound,
                         initial_state=initial_state,
                         cu_seqlens=non_spec_query_start_loc,
+                        backend=self.flashinfer_kda_backend,
                     )
                 else:
                     (

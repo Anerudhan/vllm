@@ -57,8 +57,8 @@ def gdn_calls(inputs, raw_g):
 
 
 def kda_calls(inputs, raw_g, lower_bound):
-    from vllm.model_executor.layers.mamba.ops.flashinfer_cudnn_kda import (
-        flashinfer_cudnn_kda_prefill,
+    from vllm.model_executor.layers.mamba.ops.flashinfer_kda import (
+        flashinfer_kda_prefill,
     )
     from vllm.models.kimi_k3.nvidia.kda import _flashkda_prefill
     from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
@@ -86,7 +86,8 @@ def kda_calls(inputs, raw_g, lower_bound):
             out=torch.empty_like(inputs["v"]),
         ),
         "flashinfer_cudnn": functools.partial(
-            flashinfer_cudnn_kda_prefill,
+            flashinfer_kda_prefill,
+            backend="cudnn",
             **kwargs,
             dt_bias=dt_bias,
             out=torch.empty_like(inputs["v"]),

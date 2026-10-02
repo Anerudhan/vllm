@@ -34,9 +34,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.flashinfer_cudnn_kda import (
-    flashinfer_cudnn_kda_prefill,
-    validate_flashinfer_cudnn_kda_prefill,
+from vllm.model_executor.layers.mamba.ops.flashinfer_kda import (
+    flashinfer_kda_prefill,
+    validate_flashinfer_kda_prefill,
 )
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -60,7 +60,6 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.flashinfer import (
     flashinfer_fused_kda_decode,
     flashinfer_packed_fused_kda_decode,
-    flashinfer_recurrent_kda,
     has_flashinfer_fused_kda_decode,
     has_flashinfer_packed_fused_kda_decode,
     has_flashinfer_recurrent_kda,
@@ -426,85 +425,40 @@ def _flashkda_prefill(
     return out, final_state
 
 
-def _flashinfer_kda_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    raw_g: torch.Tensor,
-    raw_beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    out: torch.Tensor,
-    seq_order: torch.Tensor | None = None,
-    prefill_workspace: object | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    output, _ = flashinfer_recurrent_kda(
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
-        g=raw_g.contiguous(),
-        beta=raw_beta.contiguous(),
-        A_log=A_log.contiguous(),
-        dt_bias=dt_bias.contiguous(),
-        scale=q.shape[-1] ** -0.5,
-        initial_state=initial_state.contiguous(),
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens.contiguous(),
-        output=out,
-        beta_is_logit=True,
-        seq_order=seq_order,
-        prefill_workspace=prefill_workspace,
-    )
-    return output, initial_state
-
-
 def resolve_kda_prefill_backend(
     backend: str,
     head_dim: int,
     input_dtype: torch.dtype,
     recurrent_state_dtype: torch.dtype,
     lower_bound: float | None,
+    flashinfer_backend: str = "auto",
 ) -> str:
-    if backend == "flashinfer_cudnn":
-        validate_flashinfer_cudnn_kda_prefill(
-            head_dim, input_dtype, recurrent_state_dtype, lower_bound
+    if backend == "flashinfer":
+        validate_flashinfer_kda_prefill(
+            head_dim,
+            input_dtype,
+            recurrent_state_dtype,
+            lower_bound,
+            backend=flashinfer_backend,
+        )
+        logger.info_once(
+            "Using FlashInfer KDA prefill backend: %s.", flashinfer_backend
         )
         return backend
     if backend not in ("auto", "triton", "flashkda", "flashinfer"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
-    flashinfer_supported = is_flashinfer_recurrent_kda_prefill_supported(
-        head_dim,
-        input_dtype,
-        recurrent_state_dtype,
-        lower_bound,
-    )
     flashkda_supported = is_flashkda_supported(
         head_dim,
         input_dtype,
         recurrent_state_dtype,
         lower_bound,
     )
-    if backend == "flashinfer" and not flashinfer_supported:
-        raise RuntimeError(
-            "FlashInfer KDA prefill requires CUDA SM100 or SM103, bfloat16 "
-            "activations and recurrent state, head_dim=128, a bounded KDA "
-            "gate, and flashinfer-python 0.6.18 or newer."
-        )
     if backend == "flashkda" and not flashkda_supported:
         raise RuntimeError(
             "FlashKDA requires CUDA SM90/SM10x/SM12x, bfloat16 input, "
             "bfloat16 or float32 recurrent state, head_dim=128, and a bounded "
             "KDA gate."
         )
-    if flashinfer_supported and backend == "flashinfer":
-        logger.info_once("Using FlashInfer KDA prefill backend.")
-        return "flashinfer"
     if flashkda_supported and backend in ("auto", "flashkda"):
         logger.info_once("Using FlashKDA KDA prefill backend.")
         return "flashkda"
@@ -758,12 +712,18 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             if isinstance(additional_config, dict)
             else "auto"
         )
+        self.flashinfer_kda_backend = (
+            additional_config.get("flashinfer_kda_backend", "auto")
+            if isinstance(additional_config, dict)
+            else "auto"
+        )
         self.kda_prefill_backend = resolve_kda_prefill_backend(
             backend,
             self.head_dim,
             vllm_config.model_config.dtype,
             recurrent_state_dtype,
             self.gate_lower_bound,
+            flashinfer_backend=self.flashinfer_kda_backend,
         )
         self._flashkda_buffer_specs: (
             tuple[tuple[tuple[int, ...], torch.dtype], ...] | None
@@ -786,7 +746,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ((workspace_size,), torch.uint8),
             )
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
-        elif self.kda_prefill_backend in ("flashinfer", "flashinfer_cudnn"):
+        elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
             self._flashinfer_kda_output_spec = (
@@ -1271,7 +1231,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             final_state=final_state[: initial_state.shape[0]],
                             workspace=workspace,
                         )
-                elif self.kda_prefill_backend in ("flashinfer", "flashinfer_cudnn"):
+                elif self.kda_prefill_backend == "flashinfer":
                     flashinfer_out = core_attn_out[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashinfer_out = non_spec_out
@@ -1281,51 +1241,42 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self._flashinfer_kda_output_spec
                         )
                         flashinfer_out = workspace_out[:, : q_ns.shape[1]]
-                    if self.kda_prefill_backend == "flashinfer_cudnn":
+                    if self.flashinfer_kda_backend == "cudnn":
                         if checkpoint is not None:
                             raise NotImplementedError(
                                 "FlashInfer cuDNN KDA prefill does not support "
                                 "state checkpoints. Use kda_prefill_backend=flashkda."
                             )
                         assert non_spec_query_start_loc is not None
-                        (
-                            core_attn_out_non_spec,
-                            last_recurrent_state,
-                        ) = flashinfer_cudnn_kda_prefill(
-                            q=q_ns,
-                            k=k_ns,
-                            v=v_ns,
-                            raw_g=g1_ns,
-                            raw_beta=beta_ns,
-                            A_log=self.A_log,
-                            dt_bias=self.dt_bias,
-                            lower_bound=self.gate_lower_bound,
-                            initial_state=initial_state,
-                            cu_seqlens=non_spec_query_start_loc,
-                            out=flashinfer_out,
-                        )
+                        flashinfer_query_start_loc = non_spec_query_start_loc
+                        flashinfer_seq_order = None
                     else:
                         assert self.gate_lower_bound is not None
                         assert m.flashinfer_prefill_query_start_loc is not None
                         if q_ns.shape[1] > initial_state.shape[0]:
                             assert m.flashinfer_prefill_seq_order is not None
-                        (
-                            core_attn_out_non_spec,
-                            last_recurrent_state,
-                        ) = _flashinfer_kda_prefill(
-                            q=q_ns,
-                            k=k_ns,
-                            v=v_ns,
-                            raw_g=g1_ns,
-                            raw_beta=beta_ns,
-                            A_log=self.A_log,
-                            dt_bias=self.dt_bias,
-                            lower_bound=self.gate_lower_bound,
-                            initial_state=initial_state,
-                            cu_seqlens=m.flashinfer_prefill_query_start_loc,
-                            out=flashinfer_out,
-                            seq_order=m.flashinfer_prefill_seq_order,
+                        flashinfer_query_start_loc = (
+                            m.flashinfer_prefill_query_start_loc
                         )
+                        flashinfer_seq_order = m.flashinfer_prefill_seq_order
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = flashinfer_kda_prefill(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        cu_seqlens=flashinfer_query_start_loc,
+                        out=flashinfer_out,
+                        backend=self.flashinfer_kda_backend,
+                        seq_order=flashinfer_seq_order,
+                    )
                 else:
                     (
                         core_attn_out_non_spec,
@@ -1391,8 +1342,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 )
         elif core_attn_out_non_spec is not None:
             if (
-                self.kda_prefill_backend
-                not in ("flashkda", "flashinfer", "flashinfer_cudnn")
+                self.kda_prefill_backend not in ("flashkda", "flashinfer")
                 or m.num_prefills == 0
             ):
                 # TODO: decode kernels write directly to core_attn_out

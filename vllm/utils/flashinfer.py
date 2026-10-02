@@ -470,6 +470,16 @@ def has_flashinfer_bf16_fp4() -> bool:
 
 
 @functools.cache
+def resolve_flashinfer_gdn_backend(backend: str) -> str:
+    if backend != "auto":
+        return backend
+    mod = _get_submodule("flashinfer")
+    if Version(getattr(mod, "__version__", "0")) < Version("0.7.1"):
+        return "flashinfer"
+    return backend
+
+
+@functools.cache
 def has_flashinfer_gdn_max_seqlen() -> bool:
     if not has_flashinfer():
         return False
@@ -1366,6 +1376,7 @@ __all__ = [
     "has_flashinfer_cudnn_gdn",
     "has_flashinfer_cudnn_kda",
     "has_flashinfer_gdn_max_seqlen",
+    "resolve_flashinfer_gdn_backend",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",

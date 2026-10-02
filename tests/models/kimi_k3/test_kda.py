@@ -19,9 +19,9 @@ from vllm.model_executor.layers.mamba.kda_checkpoint import (
     FlashKDAPrefillCheckpointExporter,
 )
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
-from vllm.model_executor.layers.mamba.ops.flashinfer_cudnn_kda import (
-    flashinfer_cudnn_kda_prefill,
-    validate_flashinfer_cudnn_kda_prefill,
+from vllm.model_executor.layers.mamba.ops.flashinfer_kda import (
+    flashinfer_kda_prefill,
+    validate_flashinfer_kda_prefill,
 )
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
@@ -35,7 +35,6 @@ from vllm.models.kimi_k3.amd.ops.third_party.kda import (
 from vllm.models.kimi_k3.nvidia import kda as nvidia_kda
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
-    _flashinfer_kda_prefill,
     _flashkda_prefill,
     is_flashinfer_fused_kda_decode_supported,
     is_flashinfer_fused_kda_spec_decode_supported,
@@ -1477,8 +1476,8 @@ def _require_kda_prefill_backend(
 ) -> None:
     if backend == "flashinfer_cudnn":
         try:
-            validate_flashinfer_cudnn_kda_prefill(
-                128, torch.bfloat16, state_dtype, lower_bound
+            validate_flashinfer_kda_prefill(
+                128, torch.bfloat16, state_dtype, lower_bound, backend="cudnn"
             )
         except RuntimeError as exc:
             pytest.skip(str(exc))
@@ -1511,7 +1510,8 @@ def _run_kda_prefill_backend(
     initial_state = initial_state.clone()
     output = torch.empty_like(v)
     if backend == "flashinfer_cudnn":
-        return flashinfer_cudnn_kda_prefill(
+        return flashinfer_kda_prefill(
+            backend="cudnn",
             q=q,
             k=k,
             v=v,
@@ -1532,7 +1532,7 @@ def _run_kda_prefill_backend(
             seq_order = torch.argsort(
                 flashinfer_query_start_loc.diff(), descending=True
             ).to(torch.int32)
-        return _flashinfer_kda_prefill(
+        return flashinfer_kda_prefill(
             q=q,
             k=k,
             v=v,
@@ -1695,15 +1695,60 @@ def test_kda_prefill_correctness(
 def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
     with pytest.raises(ValueError, match="requires a bounded gate"):
         nvidia_kda.resolve_kda_prefill_backend(
-            "flashinfer_cudnn", 128, torch.bfloat16, torch.float32, lower_bound
+            "flashinfer",
+            128,
+            torch.bfloat16,
+            torch.float32,
+            lower_bound,
+            flashinfer_backend="cudnn",
         )
+
+
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+def test_flashinfer_kda_prefill_preserves_backend_state_contract(monkeypatch, backend):
+    from vllm.model_executor.layers.mamba.ops import flashinfer_kda
+
+    captured = {}
+
+    def recurrent_kda(**kwargs):
+        captured.update(kwargs)
+        kwargs["initial_state"].add_(1)
+        return kwargs["q"], None
+
+    monkeypatch.setattr(flashinfer_kda, "flashinfer_recurrent_kda", recurrent_kda)
+    monkeypatch.setattr(flashinfer_kda, "l2norm_fwd", lambda x: x)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    q = torch.zeros(1, 2, 1, 128, dtype=torch.bfloat16)
+    state = torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16)
+    lower_bound = -6.0 if backend == "auto" else -5.0
+    _, final_state = flashinfer_kda_prefill(
+        q=q,
+        k=q,
+        v=q,
+        raw_g=q,
+        raw_beta=torch.zeros(1, 2, 1, dtype=torch.bfloat16),
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(128),
+        lower_bound=lower_bound,
+        initial_state=state,
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int64),
+        backend=backend,
+    )
+    assert captured["backend"] == backend
+    assert captured["lower_bound"] == lower_bound
+    assert captured["use_qk_l2norm_in_kernel"] == (backend == "auto")
+    torch.testing.assert_close(final_state, torch.ones_like(state))
+    expected_input = (
+        torch.ones_like(state) if backend == "auto" else torch.zeros_like(state)
+    )
+    torch.testing.assert_close(state, expected_input)
 
 
 def test_cudnn_kda_prefill_rejects_batch_invariant(monkeypatch):
     inputs = _make_kda_prefill_inputs(torch.float32, lower_bound=-5.0)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     with pytest.raises(NotImplementedError, match="does not expose batch_invariant"):
-        flashinfer_cudnn_kda_prefill(**vars(inputs))
+        flashinfer_kda_prefill(**vars(inputs), backend="cudnn")
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
@@ -1753,11 +1798,13 @@ def test_cudnn_kda_prefill_preserves_initial_state_under_graph_replay(lower_boun
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
-        flashinfer_cudnn_kda_prefill(**vars(inputs), out=out)
+        flashinfer_kda_prefill(**vars(inputs), out=out, backend="cudnn")
     capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        actual_out, actual_state = flashinfer_cudnn_kda_prefill(**vars(inputs), out=out)
+        actual_out, actual_state = flashinfer_kda_prefill(
+            **vars(inputs), out=out, backend="cudnn"
+        )
     graph.replay()
     torch.accelerator.synchronize()
 
@@ -1834,7 +1881,7 @@ def test_flashinfer_kda_prefill_breakable_graph_cross_stream():
         capture = BreakableCUDAGraphCapture()
         with capture:
             graph_value.add_(1)
-            capture.add_eager(lambda: _flashinfer_kda_prefill(**kwargs))
+            capture.add_eager(lambda: flashinfer_kda_prefill(**kwargs))
             graph_value.add_(1)
         capture_stream.synchronize()
     finally:
