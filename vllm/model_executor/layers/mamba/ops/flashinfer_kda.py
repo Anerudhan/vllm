@@ -87,7 +87,10 @@ def flashinfer_kda_prefill(
     else:
         final_state = initial_state.contiguous()
         v, raw_g, raw_beta = v.contiguous(), raw_g.contiguous(), raw_beta.contiguous()
-        cu_seqlens = cu_seqlens.to(torch.int64)
+        with torch.inference_mode(False):
+            cu_seqlens = cu_seqlens.to(
+                torch.int64, copy=cu_seqlens.is_inference()
+            ).contiguous()
     A_log = A_log.reshape(-1).contiguous()
     dt_bias = (
         dt_bias.reshape(-1, q.shape[-1]) if backend == "cudnn" else dt_bias.reshape(-1)

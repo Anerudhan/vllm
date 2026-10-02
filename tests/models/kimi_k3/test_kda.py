@@ -1748,7 +1748,13 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
 
 
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
-def test_flashinfer_kda_prefill_preserves_backend_state_contract(monkeypatch, backend):
+@pytest.mark.parametrize(
+    ("inference_offsets", "strided_offsets"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_flashinfer_kda_prefill_preserves_backend_state_contract(
+    monkeypatch, backend, inference_offsets, strided_offsets
+):
     from vllm.model_executor.layers.mamba.ops import flashinfer_kda
 
     captured = {}
@@ -1765,19 +1771,36 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(monkeypatch, ba
     state_dtype = torch.bfloat16 if backend == "auto" else torch.float32
     state = torch.zeros(1, 2, 128, 128, dtype=state_dtype)
     lower_bound = -6.0 if backend == "auto" else -5.0
-    _, final_state = flashinfer_kda_prefill(
-        q=q,
-        k=q,
-        v=q,
-        raw_g=q,
-        raw_beta=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
-        A_log=torch.zeros(1, 1, 2, 1),
-        dt_bias=torch.zeros(256),
-        lower_bound=lower_bound,
-        initial_state=state,
-        cu_seqlens=torch.tensor([0, 2], dtype=torch.int64),
-        backend=backend,
-    )
+    with torch.inference_mode(inference_offsets):
+        cu_seqlens = (
+            torch.tensor([0, -1, 2, -1], dtype=torch.int64)[::2]
+            if strided_offsets
+            else torch.tensor([0, 2], dtype=torch.int64)
+        )
+    with torch.inference_mode():
+        _, final_state = flashinfer_kda_prefill(
+            q=q,
+            k=q,
+            v=q,
+            raw_g=q,
+            raw_beta=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
+            A_log=torch.zeros(1, 1, 2, 1),
+            dt_bias=torch.zeros(256),
+            lower_bound=lower_bound,
+            initial_state=state,
+            cu_seqlens=cu_seqlens,
+            backend=backend,
+        )
+    if backend == "auto":
+        offsets = captured["cu_seqlens"]
+        assert not offsets.is_inference()
+        assert (offsets is cu_seqlens) == (
+            not inference_offsets and not strided_offsets
+        )
+        torch.testing.assert_close(offsets, cu_seqlens)
+        version = offsets._version
+        offsets.add_(0)
+        assert offsets._version == version + 1
     assert captured["backend"] == backend
     assert captured["lower_bound"] == lower_bound
     assert captured["use_qk_l2norm_in_kernel"] == (backend == "auto")
