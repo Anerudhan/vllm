@@ -837,9 +837,12 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: (
+        Literal["flashinfer", "flashinfer_cudnn", "triton", "cutedsl"] | None
+    ) = None
     kda_prefill_backend: (
-        Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
+        Literal["auto", "triton", "flashkda", "flashinfer", "flashinfer_cudnn", "fused"]
+        | None
     ) = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
 
@@ -1880,17 +1883,26 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "flashinfer_cudnn", "triton", "cutedsl"],
             default=None,
-            help="Select GDN prefill backend.",
+            help="Select GDN prefill backend. 'flashinfer_cudnn' uses cuDNN "
+            "through FlashInfer on SM100/SM103.",
         )
         parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
-            choices=["auto", "triton", "flashkda", "flashinfer", "fused"],
+            choices=[
+                "auto",
+                "triton",
+                "flashkda",
+                "flashinfer",
+                "flashinfer_cudnn",
+                "fused",
+            ],
             default=None,
             help="Select KDA prefill backend. 'flashkda' is CUDA-only and "
-            "'fused' is ROCm-only; 'auto' picks a supported backend.",
+            "'fused' is ROCm-only; 'flashinfer_cudnn' uses cuDNN through "
+            "FlashInfer on SM100/SM103; 'auto' picks a supported backend.",
         )
         parser.add_argument(
             "--kda-decode-backend",

@@ -38,6 +38,10 @@ from ..mamba_utils import (
     is_conv_state_dim_first,
 )
 from ..ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from ..ops.flashinfer_cudnn_kda import (
+    flashinfer_cudnn_kda_prefill,
+    validate_flashinfer_cudnn_kda_prefill,
+)
 from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
@@ -282,10 +286,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else "auto"
         )
         backend = "triton" if backend == "auto" else backend
-        assert backend == "triton", (
-            "The shared Kimi GDN layer only supports the Triton KDA "
-            f"prefill backend, got {backend!r}."
-        )
+        if backend == "flashinfer_cudnn":
+            validate_flashinfer_cudnn_kda_prefill(
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                self.get_state_dtype()[1],
+                self.gate_lower_bound,
+            )
+        elif backend != "triton":
+            raise ValueError(f"Unsupported shared Kimi KDA prefill backend: {backend}")
+        self.kda_prefill_backend = backend
         if not self.use_full_rank_gate:
             self.g_a_proj = ReplicatedLinear(
                 self.hidden_size,
@@ -535,11 +545,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.local_projection_size, dim=-1
                 )
 
-                # Packed prefill conv would require copying V solely to make
-                # it dense for KDA. Separate calls accept the strided inputs
-                # and produce dense Q/K/V without that extra traffic.
-                # TODO: Use packed conv once every KDA prefill backend accepts
-                # row-strided Q/K/V directly.
+                # Separate convolutions produce dense Q/K/V without copying V.
                 def _prefill_conv(
                     x: torch.Tensor,
                     state: torch.Tensor,
@@ -572,24 +578,46 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     non_spec_state_indices_tensor,
                     has_initial_state,
                 )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=q_ns,
-                    k=k_ns,
-                    v=v_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=non_spec_query_start_loc,
-                )
-                # Init cache
+                if self.kda_prefill_backend == "flashinfer_cudnn":
+                    if m.checkpoint is not None:
+                        raise NotImplementedError(
+                            "FlashInfer cuDNN KDA prefill does not support "
+                            "state checkpoints."
+                        )
+                    assert non_spec_query_start_loc is not None
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = flashinfer_cudnn_kda_prefill(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        cu_seqlens=non_spec_query_start_loc,
+                    )
+                else:
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                    )
                 recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
 
             else:

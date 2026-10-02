@@ -59,6 +59,7 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.utils.flashinfer import flashinfer_cudnn_gdn, has_flashinfer_cudnn_gdn
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -92,21 +93,8 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
-    """Resolve GDN prefill backend.
-
-    FlashInfer's GDN prefill kernel is chosen when:
-    * ``requested in ["flashinfer", "auto"]``;
-    * ``platform == cuda``;
-    * one of the following:
-      - Hopper (SM90) - no further constraints;
-      - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``;
-      - Blackwell (SM12.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
-
-    In-tree CuteDSL GDN prefill kernel is chosen when:
-    * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
-    """
+) -> tuple[str, Literal["triton", "flashinfer", "flashinfer_cudnn", "cutedsl"]]:
+    """Resolve GDN prefill while keeping cuDNN and CuteDSL opt-in."""
     additional_config = vllm_config.additional_config
     backend_cfg = (
         additional_config.get("gdn_prefill_backend", "auto")
@@ -114,6 +102,29 @@ def _resolve_gdn_prefill_backend(
         else "auto"
     )
     backend = str(backend_cfg).strip().lower()
+
+    if backend == "flashinfer_cudnn":
+        config = vllm_config.model_config
+        if not (
+            current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability(100)
+                or current_platform.is_device_capability(103)
+            )
+            and config.dtype == torch.bfloat16
+            and getattr(config.hf_text_config, "linear_key_head_dim", None) == 128
+            and getattr(config.hf_text_config, "linear_value_head_dim", None) == 128
+        ):
+            raise ValueError(
+                "FlashInfer cuDNN GDN prefill requires CUDA SM100/SM103, "
+                "bfloat16 inputs, and key/value head dimensions of 128."
+            )
+        if not has_flashinfer_cudnn_gdn():
+            raise RuntimeError(
+                "FlashInfer cuDNN GDN prefill requires FlashInfer with cuDNN "
+                "linear attention and nvidia-cudnn-frontend[cutedsl]>=1.30.0."
+            )
+        return backend, "flashinfer_cudnn"
 
     if not current_platform.is_cuda():
         return backend, "triton"
@@ -171,6 +182,7 @@ def _log_gdn_backend_decision(
 
     chosen = {
         "flashinfer": "FlashInfer",
+        "flashinfer_cudnn": "FlashInfer cuDNN",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
     }[active_backend]
@@ -197,6 +209,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    backend: Literal["flashinfer", "cudnn"] = "flashinfer",
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -206,7 +219,6 @@ def fi_chunk_gated_delta_rule(
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
 
-    # use flashinfer implementation
     q = q.squeeze(0).contiguous()
     k = k.squeeze(0).contiguous()
     v = v.squeeze(0).contiguous()
@@ -218,7 +230,13 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
-    result = chunk_gated_delta_rule_fi(
+    prefill = flashinfer_cudnn_gdn if backend == "cudnn" else chunk_gated_delta_rule_fi
+    backend_kwargs = (
+        {"batch_invariant": envs.VLLM_BATCH_INVARIANT}
+        if backend == "cudnn"
+        else {"backend": "flashinfer"}
+    )
+    result = prefill(
         q=q,
         k=k,
         v=v,
@@ -227,11 +245,8 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        backend="flashinfer",
+        **backend_kwargs,
     )
-    # FlashInfer returns (output, state) when output_final_state=True,
-    # or just output when output_final_state=False.
-    # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     if output_final_state:
         output, final_state = result
         return output.unsqueeze(0), final_state
@@ -255,7 +270,7 @@ class ChunkGatedDeltaRule(CustomOp):
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
-        if active_backend == "flashinfer":
+        if active_backend in ("flashinfer", "flashinfer_cudnn"):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
@@ -287,6 +302,11 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            backend=(
+                "cudnn"
+                if self.gdn_prefill_backend == "flashinfer_cudnn"
+                else "flashinfer"
+            ),
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
@@ -1087,10 +1107,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Mirror the real
-        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
-        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
+        # Match the prefill path's normalized Q/K and log-space gates.
         T = FLA_CHUNK_SIZE
         dummy_mixed_qkv = torch.randn(
             T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
@@ -1149,6 +1166,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
         except Exception:
+            if self.gdn_prefill_backend == "flashinfer_cudnn":
+                raise
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "
                 "layer %s. First inference may OOM due to "

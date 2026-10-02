@@ -472,3 +472,37 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+### cuDNN GDN and KDA Prefill
+
+The `flashinfer_cudnn` backend calls FlashInfer's cuDNN frontend implementation
+for GDN or KDA prefill. It supports SM100/SM103 GPUs, BF16 activations and head
+dimensions of 128. KDA supports FP32 or BF16 recurrent states and a bounded gate
+with `-5 <= lower_bound < 0`. GDN computes its final state in FP32 before vLLM
+stores it in the configured cache dtype.
+
+FlashInfer 0.7.0.post1 does not provide these APIs. To try this backend, install
+vLLM first, then replace FlashInfer with the following pinned main revision in
+the same environment. This requires a CUDA toolkit and Ninja for JIT compilation.
+
+```bash
+uv pip uninstall flashinfer-cubin flashinfer-jit-cache
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 uv pip install --no-deps \
+    'flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@2d696397586ecb05ff8304fa4b10193f83115a19'
+uv pip install 'nvidia-cudnn-frontend[cutedsl]==1.30.0'
+```
+
+Select the backend for the model's linear attention family:
+
+```bash
+vllm serve Qwen/Qwen3.5-35B-A3B --gdn-prefill-backend flashinfer_cudnn
+vllm serve zai-org/GLM-5.3-Flash --kda-prefill-backend flashinfer_cudnn
+```
+
+KDA selection also applies to bounded-gate Kimi-K3 configurations. Kimi Linear's
+unbounded softplus gate produces nonfinite results with cuDNN frontend 1.30.0 and
+is rejected. KDA normalizes Q/K with vLLM's epsilon before calling cuDNN.
+Unsupported hardware or dependencies produce an error when explicitly selected.
+Decode keeps the model's existing backend. KDA state checkpoints are unsupported,
+so this backend does not advertise checkpoint alignment. Automatic backend
+selection is unchanged; measure the complete serving workload before switching.

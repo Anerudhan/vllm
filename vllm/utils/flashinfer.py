@@ -17,6 +17,7 @@ from typing import Any, NoReturn
 
 import requests
 import torch
+from packaging.version import Version
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -324,6 +325,10 @@ flashinfer_fused_kda_decode = _lazy_import_wrapper(
     "flashinfer.kda_decode",
     "fused_kda_decode",
 )
+flashinfer_cudnn_gdn = _lazy_import_wrapper(
+    "flashinfer.cudnn", "cudnn_chunk_gated_delta_rule"
+)
+flashinfer_cudnn_kda = _lazy_import_wrapper("flashinfer.cudnn", "cudnn_recurrent_kda")
 
 
 # Special case for autotune since it returns a context manager
@@ -466,6 +471,28 @@ def has_flashinfer_bf16_fp4() -> bool:
     return mod is not None and all(
         hasattr(mod, name) for name in ("mm_bf16_fp4", "prepare_bf16_fp4_weights")
     )
+
+
+@functools.cache
+def _has_flashinfer_cudnn_linear_attention(name: str) -> bool:
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer.cudnn")
+    frontend = _get_submodule("cudnn")
+    return (
+        mod is not None
+        and callable(getattr(mod, name, None))
+        and frontend is not None
+        and Version(getattr(frontend, "__version__", "0")) >= Version("1.30.0")
+    )
+
+
+def has_flashinfer_cudnn_gdn() -> bool:
+    return _has_flashinfer_cudnn_linear_attention("cudnn_chunk_gated_delta_rule")
+
+
+def has_flashinfer_cudnn_kda() -> bool:
+    return _has_flashinfer_cudnn_linear_attention("cudnn_recurrent_kda")
 
 
 @functools.cache
@@ -1317,6 +1344,8 @@ __all__ = [
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "flashinfer_recurrent_kda",
     "flashinfer_fused_kda_decode",
+    "flashinfer_cudnn_gdn",
+    "flashinfer_cudnn_kda",
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
@@ -1326,6 +1355,8 @@ __all__ = [
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
+    "has_flashinfer_cudnn_gdn",
+    "has_flashinfer_cudnn_kda",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",

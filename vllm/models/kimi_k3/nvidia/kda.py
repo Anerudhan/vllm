@@ -34,6 +34,10 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.flashinfer_cudnn_kda import (
+    flashinfer_cudnn_kda_prefill,
+    validate_flashinfer_cudnn_kda_prefill,
+)
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
@@ -467,6 +471,11 @@ def resolve_kda_prefill_backend(
     recurrent_state_dtype: torch.dtype,
     lower_bound: float | None,
 ) -> str:
+    if backend == "flashinfer_cudnn":
+        validate_flashinfer_cudnn_kda_prefill(
+            head_dim, input_dtype, recurrent_state_dtype, lower_bound
+        )
+        return backend
     if backend not in ("auto", "triton", "flashkda", "flashinfer"):
         raise ValueError(f"Unsupported KDA prefill backend: {backend}")
     flashinfer_supported = is_flashinfer_recurrent_kda_prefill_supported(
@@ -777,7 +786,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ((workspace_size,), torch.uint8),
             )
             self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
-        elif self.kda_prefill_backend == "flashinfer":
+        elif self.kda_prefill_backend in ("flashinfer", "flashinfer_cudnn"):
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
             self._flashinfer_kda_output_spec = (
@@ -1262,11 +1271,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             final_state=final_state[: initial_state.shape[0]],
                             workspace=workspace,
                         )
-                elif self.kda_prefill_backend == "flashinfer":
-                    assert self.gate_lower_bound is not None
-                    assert m.flashinfer_prefill_query_start_loc is not None
-                    if q_ns.shape[1] > initial_state.shape[0]:
-                        assert m.flashinfer_prefill_seq_order is not None
+                elif self.kda_prefill_backend in ("flashinfer", "flashinfer_cudnn"):
                     flashinfer_out = core_attn_out[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashinfer_out = non_spec_out
@@ -1276,23 +1281,51 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             self._flashinfer_kda_output_spec
                         )
                         flashinfer_out = workspace_out[:, : q_ns.shape[1]]
-                    (
-                        core_attn_out_non_spec,
-                        last_recurrent_state,
-                    ) = _flashinfer_kda_prefill(
-                        q=q_ns,
-                        k=k_ns,
-                        v=v_ns,
-                        raw_g=g1_ns,
-                        raw_beta=beta_ns,
-                        A_log=self.A_log,
-                        dt_bias=self.dt_bias,
-                        lower_bound=self.gate_lower_bound,
-                        initial_state=initial_state,
-                        cu_seqlens=m.flashinfer_prefill_query_start_loc,
-                        out=flashinfer_out,
-                        seq_order=m.flashinfer_prefill_seq_order,
-                    )
+                    if self.kda_prefill_backend == "flashinfer_cudnn":
+                        if checkpoint is not None:
+                            raise NotImplementedError(
+                                "FlashInfer cuDNN KDA prefill does not support "
+                                "state checkpoints. Use kda_prefill_backend=flashkda."
+                            )
+                        assert non_spec_query_start_loc is not None
+                        (
+                            core_attn_out_non_spec,
+                            last_recurrent_state,
+                        ) = flashinfer_cudnn_kda_prefill(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            raw_g=g1_ns,
+                            raw_beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            cu_seqlens=non_spec_query_start_loc,
+                            out=flashinfer_out,
+                        )
+                    else:
+                        assert self.gate_lower_bound is not None
+                        assert m.flashinfer_prefill_query_start_loc is not None
+                        if q_ns.shape[1] > initial_state.shape[0]:
+                            assert m.flashinfer_prefill_seq_order is not None
+                        (
+                            core_attn_out_non_spec,
+                            last_recurrent_state,
+                        ) = _flashinfer_kda_prefill(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            raw_g=g1_ns,
+                            raw_beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            cu_seqlens=m.flashinfer_prefill_query_start_loc,
+                            out=flashinfer_out,
+                            seq_order=m.flashinfer_prefill_seq_order,
+                        )
                 else:
                     (
                         core_attn_out_non_spec,
@@ -1358,7 +1391,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 )
         elif core_attn_out_non_spec is not None:
             if (
-                self.kda_prefill_backend not in ("flashkda", "flashinfer")
+                self.kda_prefill_backend
+                not in ("flashkda", "flashinfer", "flashinfer_cudnn")
                 or m.num_prefills == 0
             ):
                 # TODO: decode kernels write directly to core_attn_out
