@@ -505,12 +505,17 @@ vllm serve zai-org/GLM-5.3-Flash \
     --kda-prefill-backend flashinfer --flashinfer-kda-backend cudnn
 ```
 
-Kimi-K3 supports both FlashInfer choices; `auto` retains its BF16-state native
-path. GLM and the shared Kimi adapter currently require explicit `cudnn`.
+Kimi-K3, GLM and the shared Kimi adapter accept both FlashInfer choices for
+bounded gates. Native `auto` requires BF16 state because its short-prefill
+fallback supports only BF16; select `--mamba-ssm-cache-dtype bfloat16` when
+needed. The `cudnn` choice also accepts FP32 state. Native `auto` uses
+FlashInfer normalization and its packed metadata setup can synchronize with
+the host; evaluate accuracy and serving performance before selecting it.
 The inner option does not override vLLM's provider selection: KDA provider `auto`
 still chooses FlashKDA or Triton. Kimi Linear's
-unbounded softplus gate produces nonfinite results with cuDNN frontend 1.30.0 and
-is rejected. KDA normalizes Q/K with vLLM's epsilon before calling cuDNN.
+unbounded softplus gate produces nonfinite results with cuDNN frontend 1.30.0.
+It remains outside this adapter's bounded-gate contract for both inner backends.
+KDA normalizes Q/K with vLLM's epsilon before calling cuDNN.
 Unsupported hardware produces an error when explicitly selected. Missing APIs
 or dependencies raise their normal import or call errors.
 Decode keeps the model's existing backend. KDA state checkpoints are unsupported,

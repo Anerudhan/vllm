@@ -164,7 +164,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(
@@ -292,10 +294,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else "auto"
         )
         if backend == "flashinfer":
-            if self.flashinfer_kda_backend != "cudnn":
-                raise ValueError(
-                    "Shared Kimi FlashInfer KDA prefill requires backend=cudnn."
-                )
             validate_flashinfer_kda_prefill(
                 self.head_dim,
                 vllm_config.model_config.dtype,
@@ -591,8 +589,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if self.kda_prefill_backend == "flashinfer":
                     if m.checkpoint is not None:
                         raise NotImplementedError(
-                            "FlashInfer cuDNN KDA prefill does not support "
-                            "state checkpoints."
+                            "FlashInfer KDA prefill does not support state checkpoints."
                         )
                     assert non_spec_query_start_loc is not None
                     (

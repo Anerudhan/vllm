@@ -15,6 +15,9 @@ from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.mamba.checkpoint import MambaPrefillCheckpointMetadata
+from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
+    KimiGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
     FlashKDAPrefillCheckpointExporter,
 )
@@ -147,6 +150,24 @@ def test_kda_recoverssm_config_state_layout():
         (4, 3, 32),
         (4, 3, 64),
     )
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("auto", torch.float32), ("float32", torch.float32), ("bfloat16", torch.bfloat16)],
+)
+def test_shared_kimi_layer_and_model_use_configured_state_dtype(setting, expected):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype=setting,
+            use_kda_recoverssm=False,
+        ),
+    )
+    layer_dtypes = KimiGatedDeltaNetAttention.get_state_dtype(config)
+    model_dtypes = KimiLinearForCausalLM.get_mamba_state_dtype_from_config(config)
+    assert layer_dtypes == model_dtypes == (torch.bfloat16, expected)
 
 
 @torch.inference_mode()
@@ -1442,8 +1463,10 @@ def _make_kda_prefill_inputs(
     state_dtype: torch.dtype,
     *,
     lower_bound: float | None,
+    num_tokens: int = 48,
+    num_heads: int = 2,
 ) -> SimpleNamespace:
-    B, T, H, D = 1, 48, 2, 128
+    B, T, H, D = 1, num_tokens, num_heads, 128
     torch.manual_seed(11)
     q, k, v, raw_g = [
         torch.randn(B, T, H, D, dtype=torch.bfloat16, device=DEVICE) for _ in range(4)
@@ -1451,10 +1474,11 @@ def _make_kda_prefill_inputs(
     raw_beta = torch.randn(B, T, H, dtype=torch.bfloat16, device=DEVICE)
     A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.5
     dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
-    initial_state = torch.randn(2, H, D, D, dtype=torch.float32, device=DEVICE).to(
-        state_dtype
-    )
-    cu_seqlens = torch.tensor([0, 17, T], dtype=torch.int32, device=DEVICE)
+    offsets = [0, 17, T] if T > 17 else [0, T]
+    initial_state = torch.randn(
+        len(offsets) - 1, H, D, D, dtype=torch.float32, device=DEVICE
+    ).to(state_dtype)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=DEVICE)
     return SimpleNamespace(
         q=q,
         k=k,
@@ -1473,22 +1497,23 @@ def _require_kda_prefill_backend(
     backend: str,
     state_dtype: torch.dtype,
     lower_bound: float | None,
+    *,
+    flashinfer_backend: str = "auto",
 ) -> None:
-    if backend == "flashinfer_cudnn":
+    if backend == "flashinfer":
         try:
             validate_flashinfer_kda_prefill(
-                128, torch.bfloat16, state_dtype, lower_bound, backend="cudnn"
+                128,
+                torch.bfloat16,
+                state_dtype,
+                lower_bound,
+                backend=flashinfer_backend,
             )
         except RuntimeError as exc:
             pytest.skip(str(exc))
         return
-    if backend == "flashinfer":
-        supported = is_flashinfer_recurrent_kda_prefill_supported(
-            128, torch.bfloat16, state_dtype, lower_bound
-        )
-    else:
-        assert backend == "flashkda"
-        supported = is_flashkda_supported(128, torch.bfloat16, state_dtype, lower_bound)
+    assert backend == "flashkda"
+    supported = is_flashkda_supported(128, torch.bfloat16, state_dtype, lower_bound)
     if not supported:
         pytest.skip(f"{backend} KDA prefill is not supported on this platform")
 
@@ -1506,12 +1531,20 @@ def _run_kda_prefill_backend(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
+    flashinfer_backend: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     initial_state = initial_state.clone()
     output = torch.empty_like(v)
-    if backend == "flashinfer_cudnn":
+    assert lower_bound is not None
+    if backend == "flashinfer":
+        seq_order = None
+        if flashinfer_backend == "auto":
+            cu_seqlens = cu_seqlens.to(torch.int64)
+            if q.shape[1] > initial_state.shape[0]:
+                seq_order = torch.argsort(cu_seqlens.diff(), descending=True).to(
+                    torch.int32
+                )
         return flashinfer_kda_prefill(
-            backend="cudnn",
             q=q,
             k=k,
             v=v,
@@ -1523,27 +1556,7 @@ def _run_kda_prefill_backend(
             initial_state=initial_state,
             cu_seqlens=cu_seqlens,
             out=output,
-        )
-    assert lower_bound is not None
-    if backend == "flashinfer":
-        flashinfer_query_start_loc = cu_seqlens.to(torch.int64)
-        seq_order = None
-        if q.shape[1] > initial_state.shape[0]:
-            seq_order = torch.argsort(
-                flashinfer_query_start_loc.diff(), descending=True
-            ).to(torch.int32)
-        return flashinfer_kda_prefill(
-            q=q,
-            k=k,
-            v=v,
-            raw_g=raw_g,
-            raw_beta=raw_beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            initial_state=initial_state,
-            cu_seqlens=flashinfer_query_start_loc,
-            out=output,
+            backend=flashinfer_backend,
             seq_order=seq_order,
         )
 
@@ -1612,21 +1625,24 @@ def _kda_prefill_reference(
 
 
 @pytest.mark.parametrize(
-    ("backend", "state_dtype"),
+    ("backend", "state_dtype", "flashinfer_backend"),
     [
-        pytest.param("flashkda", torch.float32, id="flashkda"),
-        pytest.param("flashinfer", torch.bfloat16, id="flashinfer"),
-        pytest.param("flashinfer_cudnn", torch.float32, id="flashinfer-cudnn"),
+        pytest.param("flashkda", torch.float32, "auto", id="flashkda"),
+        pytest.param("flashinfer", torch.bfloat16, "auto", id="flashinfer"),
+        pytest.param("flashinfer", torch.float32, "cudnn", id="flashinfer-cudnn"),
     ],
 )
 @torch.inference_mode()
 def test_kda_prefill_near_collinear_keys_remain_finite(
     backend: str,
     state_dtype: torch.dtype,
+    flashinfer_backend: str,
 ):
     """Guard against unstable inversion of near-collinear key blocks."""
     lower_bound = -5.0
-    _require_kda_prefill_backend(backend, state_dtype, lower_bound)
+    _require_kda_prefill_backend(
+        backend, state_dtype, lower_bound, flashinfer_backend=flashinfer_backend
+    )
 
     T, H, D = 16384, 1, 128
     torch.manual_seed(0)
@@ -1652,6 +1668,7 @@ def test_kda_prefill_near_collinear_keys_remain_finite(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        flashinfer_backend=flashinfer_backend,
     )
 
     assert torch.isfinite(output).all()
@@ -1659,16 +1676,20 @@ def test_kda_prefill_near_collinear_keys_remain_finite(
 
 
 @pytest.mark.parametrize(
-    ("backend", "state_dtype", "tolerance", "lower_bound"),
+    ("backend", "state_dtype", "tolerance", "lower_bound", "flashinfer_backend"),
     [
-        pytest.param("flashinfer", torch.bfloat16, 0.03, -5.0, id="flashinfer-bf16"),
-        pytest.param("flashkda", torch.bfloat16, 0.03, -5.0, id="flashkda-bf16"),
-        pytest.param("flashkda", torch.float32, 0.01, -5.0, id="flashkda-fp32"),
         pytest.param(
-            "flashinfer_cudnn", torch.bfloat16, 0.03, -5.0, id="cudnn-bounded-bf16"
+            "flashinfer", torch.bfloat16, 0.03, -5.0, "auto", id="flashinfer-bf16"
         ),
         pytest.param(
-            "flashinfer_cudnn", torch.float32, 0.03, -5.0, id="cudnn-bounded-fp32"
+            "flashkda", torch.bfloat16, 0.03, -5.0, "auto", id="flashkda-bf16"
+        ),
+        pytest.param("flashkda", torch.float32, 0.01, -5.0, "auto", id="flashkda-fp32"),
+        pytest.param(
+            "flashinfer", torch.bfloat16, 0.03, -5.0, "cudnn", id="cudnn-bounded-bf16"
+        ),
+        pytest.param(
+            "flashinfer", torch.float32, 0.03, -5.0, "cudnn", id="cudnn-bounded-fp32"
         ),
     ],
 )
@@ -1678,17 +1699,39 @@ def test_kda_prefill_correctness(
     state_dtype: torch.dtype,
     tolerance: float,
     lower_bound: float | None,
+    flashinfer_backend: str,
 ):
-    _require_kda_prefill_backend(backend, state_dtype, lower_bound)
+    _require_kda_prefill_backend(
+        backend, state_dtype, lower_bound, flashinfer_backend=flashinfer_backend
+    )
     inputs = _make_kda_prefill_inputs(state_dtype, lower_bound=lower_bound)
     expected_out, expected_state = _kda_prefill_reference(inputs)
     actual_out, actual_state = _run_kda_prefill_backend(
         backend,
+        flashinfer_backend=flashinfer_backend,
         **vars(inputs),
     )
 
     assert_close("o", expected_out, actual_out, tolerance)
     assert_close("ht", expected_state, actual_state, tolerance)
+
+
+@torch.inference_mode()
+def test_flashinfer_kda_single_token_prefill_updates_state():
+    _require_kda_prefill_backend("flashinfer", torch.bfloat16, -5.0)
+    inputs = _make_kda_prefill_inputs(
+        torch.bfloat16, lower_bound=-5.0, num_tokens=1, num_heads=16
+    )
+    for _ in range(2):
+        expected_out, expected_state = _kda_prefill_reference(inputs)
+        actual_out, actual_state = _run_kda_prefill_backend(
+            "flashinfer", **vars(inputs)
+        )
+        assert torch.isfinite(actual_out).all()
+        assert torch.isfinite(actual_state).all()
+        assert_close("o", expected_out, actual_out, 0.03)
+        assert_close("ht", expected_state, actual_state, 0.03)
+        inputs.initial_state = actual_state
 
 
 @pytest.mark.parametrize("lower_bound", [None, -6.0, 0.0])
@@ -1718,17 +1761,18 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(monkeypatch, ba
     monkeypatch.setattr(flashinfer_kda, "flashinfer_recurrent_kda", recurrent_kda)
     monkeypatch.setattr(flashinfer_kda, "l2norm_fwd", lambda x: x)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    q = torch.zeros(1, 2, 1, 128, dtype=torch.bfloat16)
-    state = torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16)
+    q = torch.zeros(1, 2, 2, 128, dtype=torch.bfloat16)
+    state_dtype = torch.bfloat16 if backend == "auto" else torch.float32
+    state = torch.zeros(1, 2, 128, 128, dtype=state_dtype)
     lower_bound = -6.0 if backend == "auto" else -5.0
     _, final_state = flashinfer_kda_prefill(
         q=q,
         k=q,
         v=q,
         raw_g=q,
-        raw_beta=torch.zeros(1, 2, 1, dtype=torch.bfloat16),
-        A_log=torch.zeros(1),
-        dt_bias=torch.zeros(128),
+        raw_beta=torch.zeros(1, 2, 2, dtype=torch.bfloat16),
+        A_log=torch.zeros(1, 1, 2, 1),
+        dt_bias=torch.zeros(256),
         lower_bound=lower_bound,
         initial_state=state,
         cu_seqlens=torch.tensor([0, 2], dtype=torch.int64),
@@ -1737,6 +1781,9 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(monkeypatch, ba
     assert captured["backend"] == backend
     assert captured["lower_bound"] == lower_bound
     assert captured["use_qk_l2norm_in_kernel"] == (backend == "auto")
+    assert captured["A_log"].shape == (2,)
+    assert captured["dt_bias"].shape == ((256,) if backend == "auto" else (2, 128))
+    assert captured["initial_state"].dtype == state_dtype
     torch.testing.assert_close(final_state, torch.ones_like(state))
     expected_input = (
         torch.ones_like(state) if backend == "auto" else torch.zeros_like(state)
@@ -1754,13 +1801,15 @@ def test_cudnn_kda_prefill_rejects_batch_invariant(monkeypatch):
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
 def test_cudnn_kda_prefill_small_qk_norm(state_dtype):
-    _require_kda_prefill_backend("flashinfer_cudnn", state_dtype, -5.0)
+    _require_kda_prefill_backend(
+        "flashinfer", state_dtype, -5.0, flashinfer_backend="cudnn"
+    )
     inputs = _make_kda_prefill_inputs(state_dtype, lower_bound=-5.0)
     inputs.q.mul_(1e-4)
     inputs.k.mul_(1e-6)
     expected_out, expected_state = _kda_prefill_reference(inputs)
     actual_out, actual_state = _run_kda_prefill_backend(
-        "flashinfer_cudnn", **vars(inputs)
+        "flashinfer", flashinfer_backend="cudnn", **vars(inputs)
     )
 
     assert_close("o", expected_out, actual_out, 0.03)
@@ -1770,7 +1819,9 @@ def test_cudnn_kda_prefill_small_qk_norm(state_dtype):
 @pytest.mark.parametrize("lower_bound", [-5.0, -1.0])
 @torch.inference_mode()
 def test_cudnn_kda_prefill_preserves_initial_state_under_graph_replay(lower_bound):
-    _require_kda_prefill_backend("flashinfer_cudnn", torch.float32, lower_bound)
+    _require_kda_prefill_backend(
+        "flashinfer", torch.float32, lower_bound, flashinfer_backend="cudnn"
+    )
     inputs = _make_kda_prefill_inputs(torch.float32, lower_bound=lower_bound)
     inputs.cu_seqlens = torch.tensor([0, 1, 17, 48], dtype=torch.int32, device=DEVICE)
     inputs.initial_state = torch.cat((inputs.initial_state[:1], inputs.initial_state))

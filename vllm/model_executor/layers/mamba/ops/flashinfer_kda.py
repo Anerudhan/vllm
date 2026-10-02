@@ -84,12 +84,14 @@ def flashinfer_kda_prefill(
         q, k = l2norm_fwd(q), l2norm_fwd(k)
         # The cuDNN dispatcher updates its input state in place.
         final_state = initial_state.clone()
-        A_log = A_log.reshape(-1)
-        dt_bias = dt_bias.reshape(-1, q.shape[-1])
     else:
         final_state = initial_state.contiguous()
         v, raw_g, raw_beta = v.contiguous(), raw_g.contiguous(), raw_beta.contiguous()
-        A_log, dt_bias = A_log.contiguous(), dt_bias.contiguous()
+        cu_seqlens = cu_seqlens.to(torch.int64)
+    A_log = A_log.reshape(-1).contiguous()
+    dt_bias = (
+        dt_bias.reshape(-1, q.shape[-1]) if backend == "cudnn" else dt_bias.reshape(-1)
+    ).contiguous()
     output, _ = flashinfer_recurrent_kda(
         q=q,
         k=k,

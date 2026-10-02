@@ -147,8 +147,6 @@ def _resolve_kda_prefill_backend(
     flashinfer_backend: str = "auto",
 ) -> str:
     if backend == "flashinfer":
-        if flashinfer_backend != "cudnn":
-            raise ValueError("GLM FlashInfer KDA prefill requires backend=cudnn.")
         validate_flashinfer_kda_prefill(
             head_dim, dtype, state_dtype, lower_bound, backend=flashinfer_backend
         )
@@ -193,7 +191,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if self.model_config is None or self.cache_config is None:
             raise ValueError("model_config and cache_config must be set")
         return MambaStateDtypeCalculator.kda_state_dtype(
-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            self.model_config.dtype,
+            self.cache_config.mamba_cache_dtype,
+            self.cache_config.mamba_ssm_cache_dtype,
         )
 
     def get_state_shape(
@@ -736,7 +736,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             elif self.kda_prefill_backend == "flashinfer":
                 if attn_metadata_narrowed.checkpoint is not None:
                     raise NotImplementedError(
-                        "FlashInfer cuDNN KDA prefill does not support "
+                        "FlashInfer KDA prefill does not support "
                         "state checkpoints. Use kda_prefill_backend=flashkda."
                     )
                 assert non_spec_query_start_loc is not None
