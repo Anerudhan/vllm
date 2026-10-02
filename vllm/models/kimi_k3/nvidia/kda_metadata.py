@@ -318,6 +318,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         self.use_flashinfer_prefill = (
             isinstance(additional_config, dict)
             and additional_config.get("kda_prefill_backend") == "flashinfer"
+            and additional_config.get("flashinfer_kda_backend", "auto") == "auto"
         )
         self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1

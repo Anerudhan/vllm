@@ -472,3 +472,56 @@ If you observe that GPU utilization is lower than expected, CPU contention may b
 vLLM supports multiple attention backends optimized for different hardware and use cases. The backend is automatically selected based on your GPU architecture, model type, and configuration, but you can also manually specify one for optimal performance.
 
 For detailed information on available backends, their feature support, and how to configure them, see the [Attention Backend Feature Support](../design/attention_backends.md) documentation.
+
+### cuDNN GDN and KDA Prefill
+
+The `flashinfer` provider calls FlashInfer's public `chunk_gated_delta_rule`
+or `recurrent_kda` dispatcher. Select its implementation separately with
+`--flashinfer-gdn-backend` or `--flashinfer-kda-backend`: `auto` uses FlashInfer's
+default, while `cudnn` selects its cuDNN frontend implementation.
+It supports SM100/SM103 GPUs, BF16 activations and head
+dimensions of 128. KDA supports FP32 or BF16 recurrent states and a bounded gate
+with `-5 <= lower_bound < 0`. GDN computes its final state in FP32 before vLLM
+stores it in the configured cache dtype.
+
+These GDN/KDA prefill paths require FlashInfer main APIs, including `max_seqlen`
+for GDN. Install vLLM first, then replace FlashInfer with the following pinned main
+revision in the same environment. FlashInfer 0.7.0.post1 is unsupported by these
+paths. This requires a CUDA toolkit and Ninja for JIT compilation.
+
+```bash
+uv pip uninstall flashinfer-cubin flashinfer-jit-cache
+BUILD_NVEP=0 FLASHINFER_BUILD_NO_PIP=1 uv pip install --no-deps \
+    'flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@3c848fe0b8d6d010436a67d315f324a25ddeb257'
+uv pip install 'nvidia-cudnn-frontend[cutedsl]==1.30.0'
+```
+
+Select the backend for the model's linear attention family:
+
+```bash
+vllm serve Qwen/Qwen3.5-35B-A3B \
+    --gdn-prefill-backend flashinfer --flashinfer-gdn-backend cudnn
+vllm serve zai-org/GLM-5.3-Flash \
+    --kda-prefill-backend flashinfer --flashinfer-kda-backend cudnn
+```
+
+Kimi-K3, GLM and the shared Kimi adapter accept both FlashInfer choices for
+bounded gates. Native `auto` requires BF16 state because its short-prefill
+fallback supports only BF16; select `--mamba-ssm-cache-dtype bfloat16` when
+needed. The `cudnn` choice also accepts FP32 state. Native `auto` uses
+FlashInfer normalization and its packed metadata setup can synchronize with
+the host; evaluate accuracy and serving performance before selecting it.
+The inner option does not override vLLM's provider selection: KDA provider `auto`
+still chooses FlashKDA or Triton. Kimi Linear's
+unbounded softplus gate produces nonfinite results with cuDNN frontend 1.30.0.
+It remains outside this adapter's bounded-gate contract for both inner backends.
+KDA normalizes Q/K with vLLM's epsilon before calling cuDNN.
+Unsupported hardware produces an error when explicitly selected. Missing APIs
+or dependencies raise their normal import or call errors.
+Decode keeps the model's existing backend. KDA state checkpoints are unsupported,
+so this backend does not advertise checkpoint alignment. Automatic backend
+selection is unchanged; measure the complete serving workload before switching.
+FlashInfer's `auto` dispatch does not select cuDNN in the pinned revision.
+The public dispatchers do not expose `batch_invariant`, so
+`VLLM_BATCH_INVARIANT=1` is rejected for this backend. KDA clones its input state
+because the public dispatcher updates that state in place; this adds copy cost.

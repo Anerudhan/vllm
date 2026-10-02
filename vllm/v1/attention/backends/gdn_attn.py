@@ -106,11 +106,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             vllm_config, kv_cache_spec
         )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _get_flashinfer_gdn_backend,
             _resolve_gdn_prefill_backend,
         )
 
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
+        self.flashinfer_gdn_backend = _get_flashinfer_gdn_backend(vllm_config)
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -484,6 +486,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(m, request_rows)
+            if (
+                checkpoint is not None
+                and self.gdn_prefill_backend == "flashinfer"
+                and self.flashinfer_gdn_backend == "cudnn"
+            ):
+                raise NotImplementedError(
+                    "FlashInfer cuDNN GDN prefill does not support state checkpoints."
+                )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from vllm.v1.worker.mamba_utils import validate_mamba_state_copy_funcs
 
 from tests.v1.attention.utils import (
     BatchSpec,
@@ -38,7 +39,6 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.mamba_utils import validate_mamba_state_copy_funcs
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
@@ -100,6 +100,7 @@ def _make_builder(
     prefix_match_unit: int | None = None,
     use_eagle: bool = False,
     disable_eagle_block_drop: bool = False,
+    flashinfer_backend: str | None = None,
 ) -> AttentionMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -122,6 +123,11 @@ def _make_builder(
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
     vllm_config.cache_config.prefix_match_unit = prefix_match_unit
+    if flashinfer_backend is not None:
+        vllm_config.additional_config.update(
+            kda_prefill_backend="flashinfer",
+            flashinfer_kda_backend=flashinfer_backend,
+        )
     builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=mamba_block_size,
@@ -142,6 +148,37 @@ def _make_builder(
         assert isinstance(builder, KimiK3KDAMetadataBuilder)
         builder.recoverssm_context = Mock()
     return builder
+
+
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+def test_flashinfer_prefill_metadata_tracks_inner_backend(backend, monkeypatch):
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    monkeypatch.setattr("vllm.v1.attention.backends.utils.PIN_MEMORY", False)
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+        flashinfer_backend=backend,
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[16, 32], query_lens=[16, 32]),
+        BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    )
+    actual = builder.build(0, common)
+    if backend == "auto":
+        torch.testing.assert_close(
+            actual.flashinfer_prefill_query_start_loc,
+            torch.tensor([0, 16, 48], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            actual.flashinfer_prefill_seq_order,
+            torch.tensor([1, 0], dtype=torch.int32),
+        )
+    else:
+        assert actual.flashinfer_prefill_query_start_loc is None
+        assert actual.flashinfer_prefill_seq_order is None
 
 
 def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
