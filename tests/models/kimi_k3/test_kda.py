@@ -1699,6 +1699,13 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
         )
 
 
+def test_cudnn_kda_prefill_rejects_batch_invariant(monkeypatch):
+    inputs = _make_kda_prefill_inputs(torch.float32, lower_bound=-5.0)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    with pytest.raises(NotImplementedError, match="does not expose batch_invariant"):
+        flashinfer_cudnn_kda_prefill(**vars(inputs))
+
+
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
 def test_cudnn_kda_prefill_small_qk_norm(state_dtype):

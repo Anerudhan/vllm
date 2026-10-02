@@ -325,10 +325,6 @@ flashinfer_fused_kda_decode = _lazy_import_wrapper(
     "flashinfer.kda_decode",
     "fused_kda_decode",
 )
-flashinfer_cudnn_gdn = _lazy_import_wrapper(
-    "flashinfer.cudnn", "cudnn_chunk_gated_delta_rule"
-)
-flashinfer_cudnn_kda = _lazy_import_wrapper("flashinfer.cudnn", "cudnn_recurrent_kda")
 
 
 # Special case for autotune since it returns a context manager
@@ -1358,8 +1354,6 @@ __all__ = [
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "flashinfer_recurrent_kda",
     "flashinfer_fused_kda_decode",
-    "flashinfer_cudnn_gdn",
-    "flashinfer_cudnn_kda",
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_comm",

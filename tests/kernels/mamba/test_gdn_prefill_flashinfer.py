@@ -14,7 +14,6 @@ if current_platform.is_rocm():
 
 import flashinfer.gdn_prefill  # noqa: E402
 
-from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     fi_chunk_gated_delta_rule,
 )  # noqa: E402
@@ -36,8 +35,9 @@ def reset_flashinfer_gdn_signature_cache():
 
 @pytest.mark.parametrize("backend", ["flashinfer", "cudnn"])
 @pytest.mark.parametrize("output_final_state", [False, True])
+@pytest.mark.parametrize("batch_invariant", [False, True])
 def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
-    monkeypatch, backend, output_final_state
+    monkeypatch, backend, output_final_state, batch_invariant
 ):
     captured = {}
 
@@ -52,30 +52,25 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
         cu_seqlens,
         *,
         backend="flashinfer",
-        batch_invariant=False,
     ):
         captured.update(locals())
         if output_final_state:
             return q, initial_state.clone()
         return q
 
-    if backend == "cudnn":
-        monkeypatch.setattr(
-            qwen_gdn_linear_attn, "flashinfer_cudnn_gdn", fake_chunk_gated_delta_rule
-        )
-    else:
-        monkeypatch.setattr(
-            flashinfer.gdn_prefill,
-            "chunk_gated_delta_rule",
-            fake_chunk_gated_delta_rule,
-        )
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", str(int(batch_invariant)))
+    monkeypatch.setattr(
+        flashinfer.gdn_prefill,
+        "chunk_gated_delta_rule",
+        fake_chunk_gated_delta_rule,
+    )
     q = torch.zeros(1, 2, 1, 2, dtype=torch.bfloat16)
     g = torch.tensor([[[-1.0], [-0.5]]])
     beta = torch.tensor([[[0.25], [0.75]]], dtype=torch.bfloat16)
     state = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.bfloat16)
     cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
 
-    output, final_state = fi_chunk_gated_delta_rule(
+    kwargs = dict(
         q=q,
         k=q,
         v=q,
@@ -88,6 +83,16 @@ def test_flashinfer_gdn_prefill_preserves_state_and_gate_contract(
         backend=backend,
     )
 
+    if batch_invariant and backend == "cudnn":
+        with pytest.raises(
+            NotImplementedError, match="does not expose batch_invariant"
+        ):
+            fi_chunk_gated_delta_rule(**kwargs)
+        assert not captured
+        return
+
+    output, final_state = fi_chunk_gated_delta_rule(**kwargs)
+    assert captured["backend"] == backend
     assert captured["cu_seqlens"].dtype == torch.int64
     torch.testing.assert_close(captured["g"], g.squeeze(0).exp())
     torch.testing.assert_close(captured["beta"], beta.squeeze(0).float())

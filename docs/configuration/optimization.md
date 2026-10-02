@@ -475,8 +475,10 @@ For detailed information on available backends, their feature support, and how t
 
 ### cuDNN GDN and KDA Prefill
 
-The `flashinfer_cudnn` backend calls FlashInfer's cuDNN frontend implementation
-for GDN or KDA prefill. It supports SM100/SM103 GPUs, BF16 activations and head
+The `flashinfer_cudnn` backend calls FlashInfer's public
+`chunk_gated_delta_rule` or `recurrent_kda` dispatcher with `backend="cudnn"`.
+These select the cuDNN frontend implementation for GDN or KDA prefill.
+It supports SM100/SM103 GPUs, BF16 activations and head
 dimensions of 128. KDA supports FP32 or BF16 recurrent states and a bounded gate
 with `-5 <= lower_bound < 0`. GDN computes its final state in FP32 before vLLM
 stores it in the configured cache dtype.
@@ -506,3 +508,7 @@ Unsupported hardware or dependencies produce an error when explicitly selected.
 Decode keeps the model's existing backend. KDA state checkpoints are unsupported,
 so this backend does not advertise checkpoint alignment. Automatic backend
 selection is unchanged; measure the complete serving workload before switching.
+FlashInfer's `auto` dispatch does not select cuDNN in the pinned revision.
+The public dispatchers do not expose `batch_invariant`, so
+`VLLM_BATCH_INVARIANT=1` is rejected for this backend. KDA clones its input state
+because the public dispatcher updates that state in place; this adds copy cost.

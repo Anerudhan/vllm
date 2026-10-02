@@ -60,7 +60,6 @@ from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.utils.flashinfer import (
-    flashinfer_cudnn_gdn,
     has_flashinfer_cudnn_gdn,
     has_flashinfer_gdn_max_seqlen,
 )
@@ -219,6 +218,11 @@ def fi_chunk_gated_delta_rule(
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
 
+    if backend == "cudnn" and envs.VLLM_BATCH_INVARIANT:
+        raise NotImplementedError(
+            "FlashInfer's GDN dispatcher does not expose batch_invariant."
+        )
+
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
@@ -234,15 +238,10 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
-    prefill = flashinfer_cudnn_gdn if backend == "cudnn" else chunk_gated_delta_rule_fi
-    backend_kwargs = (
-        {"batch_invariant": envs.VLLM_BATCH_INVARIANT}
-        if backend == "cudnn"
-        else {"backend": "flashinfer"}
-    )
+    backend_kwargs = {}
     if backend == "flashinfer" and has_flashinfer_gdn_max_seqlen():
         backend_kwargs["max_seqlen"] = q.shape[0]
-    result = prefill(
+    result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
         v=v,
@@ -251,6 +250,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        backend=backend,
         **backend_kwargs,
     )
     if output_final_state:

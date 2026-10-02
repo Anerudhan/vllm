@@ -8,7 +8,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.utils.flashinfer import (
-    flashinfer_cudnn_kda,
+    flashinfer_recurrent_kda,
     has_flashinfer_cudnn_kda,
 )
 
@@ -64,13 +64,18 @@ def flashinfer_cudnn_kda_prefill(
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     lower_bound = _validate_gate(lower_bound)
+    if envs.VLLM_BATCH_INVARIANT:
+        raise NotImplementedError(
+            "FlashInfer's KDA dispatcher does not expose batch_invariant."
+        )
     # cuDNN's fused normalization uses a different epsilon.
     q = l2norm_fwd(q.contiguous())
     k = l2norm_fwd(k.contiguous())
     A_log = A_log.reshape(-1)
     dt_bias = dt_bias.reshape(-1, q.shape[-1])
-    final_state = torch.empty_like(initial_state)
-    output, _ = flashinfer_cudnn_kda(
+    # The public dispatcher updates its input state in place.
+    final_state = initial_state.clone()
+    output, _ = flashinfer_recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -79,8 +84,7 @@ def flashinfer_cudnn_kda_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         scale=q.shape[-1] ** -0.5,
-        initial_state=initial_state,
-        output_state=final_state,
+        initial_state=final_state,
         output_final_state=True,
         use_qk_l2norm_in_kernel=False,
         use_gate_in_kernel=True,
@@ -88,6 +92,6 @@ def flashinfer_cudnn_kda_prefill(
         cu_seqlens=cu_seqlens,
         beta_is_logit=True,
         output=out,
-        batch_invariant=envs.VLLM_BATCH_INVARIANT,
+        backend="cudnn",
     )
     return output, final_state
