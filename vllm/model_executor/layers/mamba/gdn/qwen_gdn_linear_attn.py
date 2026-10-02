@@ -59,11 +59,6 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.utils.flashinfer import (
-    has_flashinfer_cudnn_gdn,
-    has_flashinfer_gdn_max_seqlen,
-    resolve_flashinfer_gdn_backend,
-)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -125,11 +120,6 @@ def _validate_cudnn_gdn_prefill(vllm_config: VllmConfig) -> None:
         raise ValueError(
             "FlashInfer cuDNN GDN prefill requires CUDA SM100/SM103, "
             "bfloat16 inputs, and key/value head dimensions of 128."
-        )
-    if not has_flashinfer_cudnn_gdn():
-        raise RuntimeError(
-            "FlashInfer cuDNN GDN prefill requires FlashInfer with cuDNN "
-            "linear attention and nvidia-cudnn-frontend[cutedsl]>=1.30.0."
         )
 
 
@@ -213,9 +203,7 @@ def _log_gdn_backend_decision(
         "triton": "Triton/FLA",
     }[active_backend]
     if active_backend == "flashinfer":
-        backend = resolve_flashinfer_gdn_backend(
-            _get_flashinfer_gdn_backend(vllm_config)
-        )
+        backend = _get_flashinfer_gdn_backend(vllm_config)
         chosen += f" ({backend})"
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
@@ -250,7 +238,6 @@ def fi_chunk_gated_delta_rule(
         raise NotImplementedError(
             "FlashInfer's GDN dispatcher does not expose batch_invariant."
         )
-    fi_backend = resolve_flashinfer_gdn_backend(backend)
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q)
@@ -267,9 +254,6 @@ def fi_chunk_gated_delta_rule(
     fi_beta = beta.to(torch.float32)
     if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.to(torch.int64)
-    backend_kwargs = {}
-    if backend != "cudnn" and has_flashinfer_gdn_max_seqlen():
-        backend_kwargs["max_seqlen"] = q.shape[0]
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
@@ -279,8 +263,8 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        backend=fi_backend,
-        **backend_kwargs,
+        backend=backend,
+        max_seqlen=q.shape[0],
     )
     if output_final_state:
         output, final_state = result

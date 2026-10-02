@@ -484,9 +484,10 @@ dimensions of 128. KDA supports FP32 or BF16 recurrent states and a bounded gate
 with `-5 <= lower_bound < 0`. GDN computes its final state in FP32 before vLLM
 stores it in the configured cache dtype.
 
-FlashInfer 0.7.0.post1 does not provide these cuDNN implementations. To try them, install
-vLLM first, then replace FlashInfer with the following pinned main revision in
-the same environment. This requires a CUDA toolkit and Ninja for JIT compilation.
+These GDN/KDA prefill paths require FlashInfer main APIs, including `max_seqlen`
+for GDN. Install vLLM first, then replace FlashInfer with the following pinned main
+revision in the same environment. FlashInfer 0.7.0.post1 is unsupported by these
+paths. This requires a CUDA toolkit and Ninja for JIT compilation.
 
 ```bash
 uv pip uninstall flashinfer-cubin flashinfer-jit-cache
@@ -510,7 +511,8 @@ The inner option does not override vLLM's provider selection: KDA provider `auto
 still chooses FlashKDA or Triton. Kimi Linear's
 unbounded softplus gate produces nonfinite results with cuDNN frontend 1.30.0 and
 is rejected. KDA normalizes Q/K with vLLM's epsilon before calling cuDNN.
-Unsupported hardware or dependencies produce an error when explicitly selected.
+Unsupported hardware produces an error when explicitly selected. Missing APIs
+or dependencies raise their normal import or call errors.
 Decode keeps the model's existing backend. KDA state checkpoints are unsupported,
 so this backend does not advertise checkpoint alignment. Automatic backend
 selection is unchanged; measure the complete serving workload before switching.

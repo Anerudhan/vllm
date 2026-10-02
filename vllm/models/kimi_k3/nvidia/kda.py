@@ -62,7 +62,6 @@ from vllm.utils.flashinfer import (
     flashinfer_packed_fused_kda_decode,
     has_flashinfer_fused_kda_decode,
     has_flashinfer_packed_fused_kda_decode,
-    has_flashinfer_recurrent_kda,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -366,7 +365,7 @@ def is_flashinfer_recurrent_kda_prefill_supported(
     recurrent_state_dtype: torch.dtype,
     lower_bound: float | None,
 ) -> bool:
-    if not current_platform.is_cuda() or not has_flashinfer_recurrent_kda():
+    if not current_platform.is_cuda():
         return False
     capability = current_platform.get_device_capability()
     if capability is None:

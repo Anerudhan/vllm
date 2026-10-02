@@ -7,11 +7,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
-from vllm.utils.flashinfer import (
-    flashinfer_recurrent_kda,
-    has_flashinfer_cudnn_kda,
-    has_flashinfer_recurrent_kda,
-)
+from vllm.utils.flashinfer import flashinfer_recurrent_kda
 
 logger = init_logger(__name__)
 
@@ -50,17 +46,11 @@ def validate_flashinfer_kda_prefill(
             if backend == "cudnn"
             else state_dtype == torch.bfloat16
         )
-        and (
-            has_flashinfer_cudnn_kda()
-            if backend == "cudnn"
-            else has_flashinfer_recurrent_kda()
-        )
     ):
         raise RuntimeError(
             f"FlashInfer KDA prefill (backend={backend}) requires SM100 or SM103, "
-            "bfloat16 input, head_dim=128, and the selected FlashInfer API. "
-            "Backend auto requires bfloat16 state; cudnn also supports float32 "
-            "state and requires cudnn-frontend >= 1.30.0."
+            "bfloat16 input, and head_dim=128. Backend auto requires bfloat16 "
+            "state; cudnn also supports float32 state."
         )
     logger.info_once("Using FlashInfer KDA prefill with backend=%s.", backend)
 

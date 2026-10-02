@@ -17,7 +17,6 @@ from typing import Any, NoReturn
 
 import requests
 import torch
-from packaging.version import Version
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -467,61 +466,6 @@ def has_flashinfer_bf16_fp4() -> bool:
     return mod is not None and all(
         hasattr(mod, name) for name in ("mm_bf16_fp4", "prepare_bf16_fp4_weights")
     )
-
-
-@functools.cache
-def resolve_flashinfer_gdn_backend(backend: str) -> str:
-    if backend != "auto":
-        return backend
-    mod = _get_submodule("flashinfer")
-    if Version(getattr(mod, "__version__", "0")) < Version("0.7.1"):
-        return "flashinfer"
-    return backend
-
-
-@functools.cache
-def has_flashinfer_gdn_max_seqlen() -> bool:
-    if not has_flashinfer():
-        return False
-    try:
-        import inspect
-
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
-
-        return "max_seqlen" in inspect.signature(chunk_gated_delta_rule).parameters
-    except (ImportError, TypeError, ValueError):
-        return False
-
-
-@functools.cache
-def _has_flashinfer_cudnn_linear_attention(name: str) -> bool:
-    if not has_flashinfer():
-        return False
-    mod = _get_submodule("flashinfer.cudnn")
-    frontend = _get_submodule("cudnn")
-    return (
-        mod is not None
-        and callable(getattr(mod, name, None))
-        and frontend is not None
-        and Version(getattr(frontend, "__version__", "0")) >= Version("1.30.0")
-    )
-
-
-def has_flashinfer_cudnn_gdn() -> bool:
-    return _has_flashinfer_cudnn_linear_attention("cudnn_chunk_gated_delta_rule")
-
-
-def has_flashinfer_cudnn_kda() -> bool:
-    return _has_flashinfer_cudnn_linear_attention("cudnn_recurrent_kda")
-
-
-@functools.cache
-def has_flashinfer_recurrent_kda() -> bool:
-    """Return whether FlashInfer recurrent KDA prefill is available."""
-    if not has_flashinfer():
-        return False
-    mod = _get_submodule("flashinfer.kda")
-    return mod is not None and callable(getattr(mod, "recurrent_kda", None))
 
 
 @functools.cache
@@ -1371,12 +1315,7 @@ __all__ = [
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
-    "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
-    "has_flashinfer_cudnn_gdn",
-    "has_flashinfer_cudnn_kda",
-    "has_flashinfer_gdn_max_seqlen",
-    "resolve_flashinfer_gdn_backend",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
