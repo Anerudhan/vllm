@@ -166,9 +166,7 @@ def flashinfer_kda_prefill(
         q, k = _normalize_qk(q, k)
         final_state = torch.empty_like(initial_state)
     else:
-        q, k = q.contiguous(), k.contiguous()
         final_state = initial_state.contiguous()
-        v, raw_g, raw_beta = v.contiguous(), raw_g.contiguous(), raw_beta.contiguous()
         if (
             cu_seqlens.is_inference()
             or cu_seqlens.dtype != torch.int64
