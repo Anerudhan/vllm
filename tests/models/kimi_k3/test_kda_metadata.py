@@ -151,34 +151,48 @@ def _make_builder(
 
 
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
-def test_flashinfer_prefill_metadata_tracks_inner_backend(backend, monkeypatch):
+@pytest.mark.parametrize(
+    "builder_cls", [KimiK3KDAMetadataBuilder, GDNAttentionMetadataBuilder]
+)
+@pytest.mark.parametrize("query_lens", [[16, 32], [1, 32], [1, 1]])
+def test_flashinfer_prefill_metadata_tracks_inner_backend(
+    backend, builder_cls, query_lens, monkeypatch
+):
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     monkeypatch.setattr("vllm.v1.attention.backends.utils.PIN_MEMORY", False)
     builder = _make_builder(
-        KimiK3KDAMetadataBuilder,
+        builder_cls,
         num_speculative_tokens=0,
         full_cuda_graph=False,
         flashinfer_backend=backend,
     )
-    common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[16, 32], query_lens=[16, 32]),
-        BLOCK_SIZE,
-        DEVICE,
-        arange_block_indices=True,
-    )
-    actual = builder.build(0, common)
-    if backend == "auto":
-        torch.testing.assert_close(
-            actual.flashinfer_prefill_query_start_loc,
-            torch.tensor([0, 16, 48], dtype=torch.int64),
+    with torch.inference_mode():
+        common = create_common_attn_metadata(
+            BatchSpec(seq_lens=[40, 64], query_lens=query_lens),
+            BLOCK_SIZE,
+            DEVICE,
+            arange_block_indices=True,
         )
+        actual = builder.build(0, common)
+    if backend == "auto" and actual.num_prefills:
+        offsets = actual.flashinfer_prefill_query_start_loc
+        assert not offsets.is_inference()
         torch.testing.assert_close(
-            actual.flashinfer_prefill_seq_order,
-            torch.tensor([1, 0], dtype=torch.int32),
+            offsets,
+            torch.tensor([0, query_lens[0], sum(query_lens)], dtype=torch.int64),
         )
+        version = offsets._version
+        offsets.add_(0)
+        assert offsets._version == version + 1
+        if isinstance(actual, KimiK3KDAMetadata):
+            torch.testing.assert_close(
+                actual.flashinfer_prefill_seq_order,
+                torch.tensor([1, 0], dtype=torch.int32),
+            )
     else:
         assert actual.flashinfer_prefill_query_start_loc is None
-        assert actual.flashinfer_prefill_seq_order is None
+        if isinstance(actual, KimiK3KDAMetadata):
+            assert actual.flashinfer_prefill_seq_order is None
 
 
 def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):

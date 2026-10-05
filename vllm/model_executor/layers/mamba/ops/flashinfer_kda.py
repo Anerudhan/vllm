@@ -13,23 +13,25 @@ from vllm.utils.flashinfer import flashinfer_recurrent_kda
 logger = init_logger(__name__)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["T", "QB", "QT", "QH", "QD", "KB", "KT", "KH", "KD", "ROWS"]
+)
 def _normalize_qk_kernel(
     Q,
     K,
     Output,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
-    QB: tl.constexpr,
-    QT: tl.constexpr,
-    QH: tl.constexpr,
-    QD: tl.constexpr,
-    KB: tl.constexpr,
-    KT: tl.constexpr,
-    KH: tl.constexpr,
-    KD: tl.constexpr,
-    ROWS: tl.constexpr,
+    QB,
+    QT,
+    QH,
+    QD,
+    KB,
+    KT,
+    KH,
+    KD,
+    ROWS,
     BLOCK_D: tl.constexpr,
 ):
     rows = tl.program_id(0) * 32 + tl.arange(0, 32)
@@ -167,10 +169,15 @@ def flashinfer_kda_prefill(
         q, k = q.contiguous(), k.contiguous()
         final_state = initial_state.contiguous()
         v, raw_g, raw_beta = v.contiguous(), raw_g.contiguous(), raw_beta.contiguous()
-        with torch.inference_mode(False):
-            cu_seqlens = cu_seqlens.to(
-                torch.int64, copy=cu_seqlens.is_inference()
-            ).contiguous()
+        if (
+            cu_seqlens.is_inference()
+            or cu_seqlens.dtype != torch.int64
+            or not cu_seqlens.is_contiguous()
+        ):
+            with torch.inference_mode(False):
+                cu_seqlens = cu_seqlens.to(
+                    torch.int64, copy=cu_seqlens.is_inference()
+                ).contiguous()
     A_log = A_log.reshape(-1).contiguous()
     dt_bias = (
         dt_bias.reshape(-1, q.shape[-1]) if backend == "cudnn" else dt_bias.reshape(-1)

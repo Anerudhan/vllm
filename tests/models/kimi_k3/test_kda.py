@@ -1749,22 +1749,25 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
 
 @pytest.mark.parametrize("layout", ["dense", "token_major", "strided_channel"])
 @pytest.mark.parametrize("scale", [0.0, 1e-5, 1.0])
+@pytest.mark.parametrize("tokens", [17, 33, 65])
 @torch.inference_mode()
-def test_flashinfer_kda_qk_normalization_preserves_epsilon_and_layout(layout, scale):
+def test_flashinfer_kda_qk_normalization_preserves_epsilon_and_layout(
+    layout, scale, tokens
+):
     from vllm.model_executor.layers.mamba.ops.flashinfer_kda import _normalize_qk
 
     def make():
         if layout == "token_major":
             return (
-                torch.randn(2, 3, 128, 33, device="cuda", dtype=torch.bfloat16)
+                torch.randn(2, 3, 128, tokens, device="cuda", dtype=torch.bfloat16)
                 .permute(0, 3, 1, 2)
                 .mul_(scale)
             )
         if layout == "strided_channel":
-            return torch.randn(2, 33, 3, 256, device="cuda", dtype=torch.bfloat16)[
+            return torch.randn(2, tokens, 3, 256, device="cuda", dtype=torch.bfloat16)[
                 ..., ::2
             ].mul_(scale)
-        return torch.randn(2, 33, 3, 128, device="cuda", dtype=torch.bfloat16).mul_(
+        return torch.randn(2, tokens, 3, 128, device="cuda", dtype=torch.bfloat16).mul_(
             scale
         )
 

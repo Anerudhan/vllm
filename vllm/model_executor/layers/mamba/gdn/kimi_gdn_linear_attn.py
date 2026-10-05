@@ -592,6 +592,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                             "FlashInfer KDA prefill does not support state checkpoints."
                         )
                     assert non_spec_query_start_loc is not None
+                    prefill_query_start_loc = non_spec_query_start_loc
+                    if self.flashinfer_kda_backend == "auto":
+                        assert m.flashinfer_prefill_query_start_loc is not None
+                        prefill_query_start_loc = m.flashinfer_prefill_query_start_loc
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
@@ -605,7 +609,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         dt_bias=self.dt_bias,
                         lower_bound=self.gate_lower_bound,
                         initial_state=initial_state,
-                        cu_seqlens=non_spec_query_start_loc,
+                        cu_seqlens=prefill_query_start_loc,
                         backend=self.flashinfer_kda_backend,
                     )
                 else:
