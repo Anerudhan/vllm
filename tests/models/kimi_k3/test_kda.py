@@ -1747,6 +1747,35 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
         )
 
 
+@pytest.mark.parametrize("layout", ["dense", "token_major", "strided_channel"])
+@pytest.mark.parametrize("scale", [0.0, 1e-5, 1.0])
+@torch.inference_mode()
+def test_flashinfer_kda_qk_normalization_preserves_epsilon_and_layout(layout, scale):
+    from vllm.model_executor.layers.mamba.ops.flashinfer_kda import _normalize_qk
+
+    def make():
+        if layout == "token_major":
+            return (
+                torch.randn(2, 3, 128, 33, device="cuda", dtype=torch.bfloat16)
+                .permute(0, 3, 1, 2)
+                .mul_(scale)
+            )
+        if layout == "strided_channel":
+            return torch.randn(2, 33, 3, 256, device="cuda", dtype=torch.bfloat16)[
+                ..., ::2
+            ].mul_(scale)
+        return torch.randn(2, 33, 3, 128, device="cuda", dtype=torch.bfloat16).mul_(
+            scale
+        )
+
+    q, k = make(), make()
+    actual = _normalize_qk(q, k)
+    expected = (l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous()))
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        assert result.is_contiguous()
+
+
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
 @pytest.mark.parametrize(
     ("inference_offsets", "strided_offsets"),
@@ -1761,11 +1790,14 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
 
     def recurrent_kda(**kwargs):
         captured.update(kwargs)
-        kwargs["initial_state"].add_(1)
+        if kwargs["output_state"] is None:
+            kwargs["initial_state"].add_(1)
+        else:
+            kwargs["output_state"].copy_(kwargs["initial_state"] + 1)
         return kwargs["q"], None
 
     monkeypatch.setattr(flashinfer_kda, "flashinfer_recurrent_kda", recurrent_kda)
-    monkeypatch.setattr(flashinfer_kda, "l2norm_fwd", lambda x: x)
+    monkeypatch.setattr(flashinfer_kda, "_normalize_qk", lambda q, k: (q, k))
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     q = torch.zeros(1, 2, 2, 128, dtype=torch.bfloat16)
     state_dtype = torch.bfloat16 if backend == "auto" else torch.float32
