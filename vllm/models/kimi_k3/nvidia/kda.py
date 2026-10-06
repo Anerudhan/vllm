@@ -1274,6 +1274,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=flashinfer_query_start_loc,
                         out=flashinfer_out,
                         backend=self.flashinfer_kda_backend,
+                        inplace_state=True,
                         seq_order=flashinfer_seq_order,
                     )
                 else:

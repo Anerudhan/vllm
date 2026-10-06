@@ -1753,8 +1753,14 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
     [(False, False), (True, False), (False, True)],
 )
 @pytest.mark.parametrize("default_fla_norm", [False, True])
+@pytest.mark.parametrize("inplace_state", [False, True])
 def test_flashinfer_kda_prefill_preserves_backend_state_contract(
-    monkeypatch, backend, inference_offsets, strided_offsets, default_fla_norm
+    monkeypatch,
+    backend,
+    inference_offsets,
+    strided_offsets,
+    default_fla_norm,
+    inplace_state,
 ):
     from vllm.model_executor.layers.mamba.ops import flashinfer_kda
 
@@ -1762,10 +1768,8 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
 
     def recurrent_kda(**kwargs):
         captured.update(kwargs)
-        if kwargs["output_state"] is None:
-            kwargs["initial_state"].add_(1)
-        else:
-            kwargs["output_state"].copy_(kwargs["initial_state"] + 1)
+        assert "output_state" not in kwargs
+        kwargs["initial_state"].add_(1)
         return kwargs["q"], None
 
     monkeypatch.setattr(flashinfer_kda, "flashinfer_recurrent_kda", recurrent_kda)
@@ -1795,6 +1799,7 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
             initial_state=state,
             cu_seqlens=cu_seqlens,
             backend=backend,
+            inplace_state=inplace_state,
         )
     if backend == "auto":
         offsets = captured["cu_seqlens"]
@@ -1818,7 +1823,9 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
     assert captured["initial_state"].dtype == state_dtype
     torch.testing.assert_close(final_state, torch.ones_like(state))
     expected_input = (
-        torch.ones_like(state) if backend == "auto" else torch.zeros_like(state)
+        torch.ones_like(state)
+        if backend == "auto" or inplace_state
+        else torch.zeros_like(state)
     )
     torch.testing.assert_close(state, expected_input)
 
@@ -1849,8 +1856,11 @@ def test_cudnn_kda_prefill_small_qk_norm(state_dtype):
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, -1.0])
+@pytest.mark.parametrize("inplace_state", [False, True])
 @torch.inference_mode()
-def test_cudnn_kda_prefill_preserves_initial_state_under_graph_replay(lower_bound):
+def test_cudnn_kda_prefill_preserves_initial_state_under_graph_replay(
+    lower_bound, inplace_state
+):
     _require_kda_prefill_backend(
         "flashinfer", torch.float32, lower_bound, flashinfer_backend="cudnn"
     )
@@ -1878,16 +1888,29 @@ def test_cudnn_kda_prefill_preserves_initial_state_under_graph_replay(lower_boun
     inputs.dt_bias = inputs.dt_bias.flatten()
     out = torch.empty_like(inputs.v)
 
+    def run():
+        kwargs = vars(inputs).copy()
+        if inplace_state:
+            indices = torch.arange(3, device=DEVICE, dtype=torch.int32)
+            has_state = torch.ones(3, device=DEVICE, dtype=torch.bool)
+            kwargs["initial_state"] = gather_initial_states(
+                inputs.initial_state, indices, has_state
+            )
+        result = flashinfer_kda_prefill(
+            **kwargs, out=out, backend="cudnn", inplace_state=inplace_state
+        )
+        if inplace_state:
+            assert result[1].data_ptr() == kwargs["initial_state"].data_ptr()
+        return result
+
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(capture_stream):
-        flashinfer_kda_prefill(**vars(inputs), out=out, backend="cudnn")
+        run()
     capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        actual_out, actual_state = flashinfer_kda_prefill(
-            **vars(inputs), out=out, backend="cudnn"
-        )
+        actual_out, actual_state = run()
     graph.replay()
     torch.accelerator.synchronize()
 

@@ -71,7 +71,10 @@ def flashinfer_kda_prefill(
     backend: str = "auto",
     seq_order: torch.Tensor | None = None,
     prefill_workspace: object | None = None,
+    *,
+    inplace_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allow cuDNN to overwrite disposable gathered state when requested."""
     if backend not in ("auto", "cudnn"):
         raise ValueError(f"Unsupported FlashInfer KDA backend: {backend}")
     lower_bound = _validate_gate(lower_bound, backend)
@@ -83,7 +86,7 @@ def flashinfer_kda_prefill(
     if backend == "cudnn":
         if not normalize_in_kernel:
             q, k = l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous())
-        final_state = torch.empty_like(initial_state)
+        final_state = initial_state if inplace_state else initial_state.clone()
     else:
         final_state = initial_state.contiguous()
         if (
@@ -108,8 +111,7 @@ def flashinfer_kda_prefill(
         A_log=A_log,
         dt_bias=dt_bias,
         scale=q.shape[-1] ** -0.5,
-        initial_state=initial_state if backend == "cudnn" else final_state,
-        output_state=final_state if backend == "cudnn" else None,
+        initial_state=final_state,
         output_final_state=backend == "cudnn",
         use_qk_l2norm_in_kernel=normalize_in_kernel,
         qk_l2norm_additive_epsilon=1e-6

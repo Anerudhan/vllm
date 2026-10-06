@@ -754,6 +754,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     cu_seqlens=non_spec_query_start_loc,
                     out=ns_out,
                     backend=self.flashinfer_kda_backend,
+                    inplace_state=True,
                 )
             else:
                 (

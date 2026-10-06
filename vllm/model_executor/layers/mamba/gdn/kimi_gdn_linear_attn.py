@@ -611,6 +611,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                         initial_state=initial_state,
                         cu_seqlens=prefill_query_start_loc,
                         backend=self.flashinfer_kda_backend,
+                        inplace_state=True,
                     )
                 else:
                     (
