@@ -1747,45 +1747,14 @@ def test_cudnn_kda_prefill_rejects_unsupported_gate(lower_bound):
         )
 
 
-@pytest.mark.parametrize("layout", ["dense", "token_major", "strided_channel"])
-@pytest.mark.parametrize("scale", [0.0, 1e-5, 1.0])
-@pytest.mark.parametrize("tokens", [17, 33, 65])
-@torch.inference_mode()
-def test_flashinfer_kda_qk_normalization_preserves_epsilon_and_layout(
-    layout, scale, tokens
-):
-    from vllm.model_executor.layers.mamba.ops.flashinfer_kda import _normalize_qk
-
-    def make():
-        if layout == "token_major":
-            return (
-                torch.randn(2, 3, 128, tokens, device="cuda", dtype=torch.bfloat16)
-                .permute(0, 3, 1, 2)
-                .mul_(scale)
-            )
-        if layout == "strided_channel":
-            return torch.randn(2, tokens, 3, 256, device="cuda", dtype=torch.bfloat16)[
-                ..., ::2
-            ].mul_(scale)
-        return torch.randn(2, tokens, 3, 128, device="cuda", dtype=torch.bfloat16).mul_(
-            scale
-        )
-
-    q, k = make(), make()
-    actual = _normalize_qk(q, k)
-    expected = (l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous()))
-    for result, reference in zip(actual, expected):
-        torch.testing.assert_close(result, reference, rtol=0, atol=0)
-        assert result.is_contiguous()
-
-
 @pytest.mark.parametrize("backend", ["auto", "cudnn"])
 @pytest.mark.parametrize(
     ("inference_offsets", "strided_offsets"),
     [(False, False), (True, False), (False, True)],
 )
+@pytest.mark.parametrize("default_fla_norm", [False, True])
 def test_flashinfer_kda_prefill_preserves_backend_state_contract(
-    monkeypatch, backend, inference_offsets, strided_offsets
+    monkeypatch, backend, inference_offsets, strided_offsets, default_fla_norm
 ):
     from vllm.model_executor.layers.mamba.ops import flashinfer_kda
 
@@ -1800,7 +1769,8 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
         return kwargs["q"], None
 
     monkeypatch.setattr(flashinfer_kda, "flashinfer_recurrent_kda", recurrent_kda)
-    monkeypatch.setattr(flashinfer_kda, "_normalize_qk", lambda q, k: (q, k))
+    monkeypatch.setattr(flashinfer_kda, "USE_DEFAULT_FLA_NORM", default_fla_norm)
+    monkeypatch.setattr(flashinfer_kda, "l2norm_fwd", lambda q: q)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     q = torch.zeros(1, 2, 2, 128, dtype=torch.bfloat16)
     state_dtype = torch.bfloat16 if backend == "auto" else torch.float32
@@ -1838,7 +1808,11 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
         assert offsets._version == version + 1
     assert captured["backend"] == backend
     assert captured["lower_bound"] == lower_bound
-    assert captured["use_qk_l2norm_in_kernel"] == (backend == "auto")
+    normalize_in_kernel = backend == "auto" or not default_fla_norm
+    assert captured["use_qk_l2norm_in_kernel"] == normalize_in_kernel
+    assert captured["qk_l2norm_additive_epsilon"] == (
+        1e-6 if backend == "cudnn" and normalize_in_kernel else None
+    )
     assert captured["A_log"].shape == (2,)
     assert captured["dt_bias"].shape == ((256,) if backend == "auto" else (2, 128))
     assert captured["initial_state"].dtype == state_dtype

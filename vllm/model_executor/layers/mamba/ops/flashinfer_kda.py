@@ -7,92 +7,10 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
-from vllm.triton_utils import tl, triton
+from vllm.third_party.flash_linear_attention.ops.l2norm import USE_DEFAULT_FLA_NORM
 from vllm.utils.flashinfer import flashinfer_recurrent_kda
 
 logger = init_logger(__name__)
-
-
-@triton.jit(
-    do_not_specialize=["T", "QB", "QT", "QH", "QD", "KB", "KT", "KH", "KD", "ROWS"]
-)
-def _normalize_qk_kernel(
-    Q,
-    K,
-    Output,
-    T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    QB,
-    QT,
-    QH,
-    QD,
-    KB,
-    KT,
-    KH,
-    KD,
-    ROWS,
-    BLOCK_D: tl.constexpr,
-):
-    rows = tl.program_id(0) * 32 + tl.arange(0, 32)
-    cols = tl.arange(0, BLOCK_D)
-    batch, token, head = rows // (T * H), rows // H % T, rows % H
-    mask = (rows[:, None] < ROWS) & (cols[None, :] < D)
-    if tl.program_id(1) == 0:
-        x = tl.load(
-            Q
-            + batch[:, None] * QB
-            + token[:, None] * QT
-            + head[:, None] * QH
-            + cols[None, :] * QD,
-            mask,
-            other=0,
-        ).to(tl.float32)
-    else:
-        x = tl.load(
-            K
-            + batch[:, None] * KB
-            + token[:, None] * KT
-            + head[:, None] * KH
-            + cols[None, :] * KD,
-            mask,
-            other=0,
-        ).to(tl.float32)
-    norm = x * tl.rsqrt(tl.sum(x * x, axis=1)[:, None] + 1e-6)
-    tl.store(
-        Output + tl.program_id(1) * ROWS * D + rows[:, None] * D + cols[None, :],
-        norm,
-        mask,
-    )
-
-
-def _normalize_qk(q: torch.Tensor, k: torch.Tensor):
-    from vllm.third_party.flash_linear_attention.ops.l2norm import USE_DEFAULT_FLA_NORM
-
-    if (
-        USE_DEFAULT_FLA_NORM
-        or q.ndim != 4
-        or q.shape != k.shape
-        or q.dtype != k.dtype
-        or q.device != k.device
-        or q.shape[-1] != 128
-    ):
-        return l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous())
-    b, t, h, d = q.shape
-    normalized = torch.empty((2, b, t, h, d), dtype=q.dtype, device=q.device)
-    _normalize_qk_kernel[(triton.cdiv(b * t * h, 32), 2)](
-        q,
-        k,
-        normalized,
-        t,
-        h,
-        d,
-        *q.stride(),
-        *k.stride(),
-        b * t * h,
-        triton.next_power_of_2(d),
-    )
-    return normalized.unbind(0)
 
 
 def _validate_gate(lower_bound: float | None, backend: str) -> float:
@@ -161,9 +79,10 @@ def flashinfer_kda_prefill(
         raise NotImplementedError(
             "FlashInfer's KDA dispatcher does not expose batch_invariant."
         )
+    normalize_in_kernel = backend != "cudnn" or not USE_DEFAULT_FLA_NORM
     if backend == "cudnn":
-        # cuDNN's fused normalization uses a different epsilon.
-        q, k = _normalize_qk(q, k)
+        if not normalize_in_kernel:
+            q, k = l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous())
         final_state = torch.empty_like(initial_state)
     else:
         final_state = initial_state.contiguous()
@@ -192,7 +111,10 @@ def flashinfer_kda_prefill(
         initial_state=initial_state if backend == "cudnn" else final_state,
         output_state=final_state if backend == "cudnn" else None,
         output_final_state=backend == "cudnn",
-        use_qk_l2norm_in_kernel=backend != "cudnn",
+        use_qk_l2norm_in_kernel=normalize_in_kernel,
+        qk_l2norm_additive_epsilon=1e-6
+        if backend == "cudnn" and normalize_in_kernel
+        else None,
         use_gate_in_kernel=True,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens.contiguous(),
