@@ -89,6 +89,9 @@ def flashinfer_kda_prefill(
         final_state = initial_state if inplace_state else initial_state.clone()
     else:
         final_state = initial_state.contiguous()
+        # FI's prefill packing does not cover one-token dispatch.
+        q, k = q.contiguous(), k.contiguous()
+        v, raw_g, raw_beta = v.contiguous(), raw_g.contiguous(), raw_beta.contiguous()
         if (
             cu_seqlens.is_inference()
             or cu_seqlens.dtype != torch.int64

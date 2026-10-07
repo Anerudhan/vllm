@@ -1717,11 +1717,24 @@ def test_kda_prefill_correctness(
 
 
 @torch.inference_mode()
-def test_flashinfer_kda_single_token_prefill_updates_state():
+@pytest.mark.parametrize("strided", [False, True])
+def test_flashinfer_kda_single_token_prefill_updates_state(strided):
     _require_kda_prefill_backend("flashinfer", torch.bfloat16, -5.0)
     inputs = _make_kda_prefill_inputs(
         torch.bfloat16, lower_bound=-5.0, num_tokens=1, num_heads=16
     )
+    if strided:
+        for name in ("q", "k", "v", "raw_g", "raw_beta"):
+            value = getattr(inputs, name)
+            storage = torch.empty(
+                *value.shape[:-1],
+                value.shape[-1] * 2,
+                device=value.device,
+                dtype=value.dtype,
+            )
+            view = storage[..., ::2]
+            view.copy_(value)
+            setattr(inputs, name, view)
     for _ in range(2):
         expected_out, expected_state = _kda_prefill_reference(inputs)
         actual_out, actual_state = _run_kda_prefill_backend(
@@ -1776,7 +1789,7 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
     monkeypatch.setattr(flashinfer_kda, "USE_DEFAULT_FLA_NORM", default_fla_norm)
     monkeypatch.setattr(flashinfer_kda, "l2norm_fwd", lambda q: q)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    q = torch.zeros(1, 2, 2, 128, dtype=torch.bfloat16)
+    q = torch.zeros(1, 2, 2, 256, dtype=torch.bfloat16)[..., ::2]
     state_dtype = torch.bfloat16 if backend == "auto" else torch.float32
     state = torch.zeros(1, 2, 128, 128, dtype=state_dtype)
     lower_bound = -6.0 if backend == "auto" else -5.0
@@ -1812,6 +1825,12 @@ def test_flashinfer_kda_prefill_preserves_backend_state_contract(
         offsets.add_(0)
         assert offsets._version == version + 1
     assert captured["backend"] == backend
+    if backend == "auto":
+        assert all(
+            captured[name].is_contiguous() for name in ("q", "k", "v", "g", "beta")
+        )
+    elif not default_fla_norm:
+        assert captured["q"] is q and captured["k"] is q
     assert captured["lower_bound"] == lower_bound
     normalize_in_kernel = backend == "auto" or not default_fla_norm
     assert captured["use_qk_l2norm_in_kernel"] == normalize_in_kernel
