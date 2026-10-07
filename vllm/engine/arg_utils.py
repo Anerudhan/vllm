@@ -838,9 +838,11 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    flashinfer_gdn_backend: Literal["auto", "cudnn"] | None = None
     kda_prefill_backend: (
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
     ) = None
+    flashinfer_kda_backend: Literal["auto", "cudnn"] | None = None
     kda_decode_backend: Literal["auto", "native", "flashinfer", "triton"] | None = None
 
     def __post_init__(self):
@@ -1885,12 +1887,36 @@ class EngineArgs:
             help="Select GDN prefill backend.",
         )
         parser.add_argument(
+            "--flashinfer-gdn-backend",
+            dest="flashinfer_gdn_backend",
+            choices=["auto", "cudnn"],
+            default=None,
+            help="Select the FlashInfer implementation with --gdn-prefill-backend "
+            "flashinfer. 'auto' uses FlashInfer's default; 'cudnn' requires "
+            "SM100/SM103 and cudnn-frontend >= 1.30.0.",
+        )
+        parser.add_argument(
             "--kda-prefill-backend",
             dest="kda_prefill_backend",
-            choices=["auto", "triton", "flashkda", "flashinfer", "fused"],
+            choices=[
+                "auto",
+                "triton",
+                "flashkda",
+                "flashinfer",
+                "fused",
+            ],
             default=None,
             help="Select KDA prefill backend. 'flashkda' is CUDA-only and "
             "'fused' is ROCm-only; 'auto' picks a supported backend.",
+        )
+        parser.add_argument(
+            "--flashinfer-kda-backend",
+            dest="flashinfer_kda_backend",
+            choices=["auto", "cudnn"],
+            default=None,
+            help="Select the FlashInfer implementation with --kda-prefill-backend "
+            "flashinfer. 'auto' uses FlashInfer's default; 'cudnn' requires "
+            "SM100/SM103 and cudnn-frontend >= 1.30.0.",
         )
         parser.add_argument(
             "--kda-decode-backend",
@@ -2762,6 +2788,10 @@ class EngineArgs:
 
         if self.gdn_prefill_backend is not None:
             self.additional_config["gdn_prefill_backend"] = self.gdn_prefill_backend
+        if self.flashinfer_gdn_backend is not None:
+            self.additional_config["flashinfer_gdn_backend"] = (
+                self.flashinfer_gdn_backend
+            )
         if self.kda_prefill_backend is not None:
             if (
                 self.kda_prefill_backend == "flashkda"
@@ -2775,6 +2805,10 @@ class EngineArgs:
                     "--kda-prefill-backend=fused is only available on ROCm."
                 )
             self.additional_config["kda_prefill_backend"] = self.kda_prefill_backend
+        if self.flashinfer_kda_backend is not None:
+            self.additional_config["flashinfer_kda_backend"] = (
+                self.flashinfer_kda_backend
+            )
         if self.kda_decode_backend is not None:
             self.additional_config["kda_decode_backend"] = self.kda_decode_backend
 
