@@ -79,6 +79,7 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    flashinfer_prefill_query_start_loc: torch.Tensor | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -106,11 +107,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             vllm_config, kv_cache_spec
         )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _get_flashinfer_gdn_backend,
             _resolve_gdn_prefill_backend,
         )
 
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)
+        self.flashinfer_gdn_backend = _get_flashinfer_gdn_backend(vllm_config)
+        additional_config = vllm_config.additional_config
+        self.use_flashinfer_prefill = (
+            isinstance(additional_config, dict)
+            and additional_config.get("kda_prefill_backend") == "flashinfer"
+            and additional_config.get("flashinfer_kda_backend", "auto") == "auto"
+        )
 
         if self.speculative_config:
             assert self.speculative_config.num_speculative_tokens is not None
@@ -185,6 +194,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+
+    def _build_flashinfer_prefill_query_start_loc(
+        self, query_start_loc: torch.Tensor | None, num_prefills: int
+    ) -> torch.Tensor | None:
+        if not self.use_flashinfer_prefill or num_prefills == 0:
+            return None
+        assert query_start_loc is not None
+        # FlashInfer caches packed metadata by tensor identity and version.
+        with torch.inference_mode(False):
+            return query_start_loc.to(
+                torch.int64, copy=query_start_loc.is_inference()
+            ).contiguous()
 
     def _build_chunk_metadata(
         self,
@@ -484,6 +505,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if spec_sequence_masks_cpu is not None:
                 request_rows = (~spec_sequence_masks_cpu).nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(m, request_rows)
+            if (
+                checkpoint is not None
+                and self.gdn_prefill_backend == "flashinfer"
+                and self.flashinfer_gdn_backend == "cudnn"
+            ):
+                raise NotImplementedError(
+                    "FlashInfer cuDNN GDN prefill does not support state checkpoints."
+                )
 
         # Function code counted on either presency non-spec decode or spec decode,
         # but not both.
@@ -569,6 +598,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            flashinfer_prefill_query_start_loc=(
+                self._build_flashinfer_prefill_query_start_loc(
+                    non_spec_query_start_loc, num_prefills
+                )
+            ),
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
