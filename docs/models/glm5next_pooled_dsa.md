@@ -10,6 +10,18 @@ Set `VLLM_GLM5NEXT_USE_CUDNN_KPOOL=1`. The default is `0`.
 
 This route requires CuTe DSL **4.8.0** and cuDNN Frontend develop at
 `50950b2aa2cf38b1f73278e74e45f16144e7ecea` with the pooled DSA additions.
+The additions are in [cuDNN Frontend PR #1847](https://github.com/NVIDIA/cudnn-frontend/pull/1847).
+Install the pinned source in your vLLM environment:
+
+```bash
+git clone --branch feat/pooled-dsa-blackwell https://github.com/Anerudhan/cudnn-frontend.git
+git -C cudnn-frontend checkout 55605dc6e53313366f757a274d7ce1d6468a3e74
+uv pip install "nvidia-cutlass-dsl==4.8.0" -e ./cudnn-frontend
+```
+
+The build needs CUDA and cuDNN headers/libraries; see the
+[frontend build guide](https://github.com/Anerudhan/cudnn-frontend/tree/feat/pooled-dsa-blackwell#building-from-source).
+
 The required internal entry is
 `cudnn.deepseek_sparse_attention.pooled.forward._compile_pooled_select`.
 It is not supplied by an unmodified frontend release. An eligible call
