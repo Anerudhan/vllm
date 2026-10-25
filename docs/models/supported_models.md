@@ -5,6 +5,9 @@ vLLM supports [generative](./generative_models.md) and [pooling](./pooling_model
 For each task, we list the model architectures that have been implemented in vLLM.
 Alongside each architecture, we include some popular models that use it.
 
+For the experimental GLM-5.3-Flash pooled-indexer route, see
+[GLM-5.3-Flash pooled indexer](glm5next_pooled_dsa.md).
+
 ## Model Implementation
 
 ### vLLM

@@ -164,6 +164,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    PREFILL_TOKENS: tl.constexpr = False,
 ):
     """One program per pool. softmax(slot_score+ape)-weighted sum of slot_k ->
     Hadamard-128 -> per-vector fp8 absmax quant -> write to cache at ``loc``."""
@@ -171,6 +172,10 @@ def _kpool_softmax_rotate_write_cache_kernel(
     do_write = True
     if HAS_WRITE_MASK:
         do_write = tl.load(write_mask_ptr + row)
+    source_row = row
+    if PREFILL_TOKENS:
+        do_write = do_write & (row >= POOL_SIZE - 1) & (tl.load(loc_ptr + row) >= 0)
+        source_row = row - (POOL_SIZE - 1)
 
     offs = tl.arange(0, BLOCK_D)
     mask = (offs < HEAD_DIM) & do_write
@@ -180,7 +185,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         score = tl.load(
             slot_score_ptr
-            + row * slot_score_stride_0
+            + source_row * slot_score_stride_0
             + slot * slot_score_stride_1
             + offs,
             mask=mask,
@@ -197,7 +202,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     for slot in tl.static_range(0, POOL_SIZE):
         score = tl.load(
             slot_score_ptr
-            + row * slot_score_stride_0
+            + source_row * slot_score_stride_0
             + slot * slot_score_stride_1
             + offs,
             mask=mask,
@@ -209,7 +214,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
         prob = tl.exp(score - max_score)
         denom += prob
         k = tl.load(
-            slot_k_ptr + row * slot_k_stride_0 + slot * slot_k_stride_1 + offs,
+            slot_k_ptr + source_row * slot_k_stride_0 + slot * slot_k_stride_1 + offs,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -283,26 +288,30 @@ def kpool_compress_and_write_cache(
 
     Args:
         kv_cache: indexer K cache ``[num_blocks, block_size, head_dim+4]`` uint8.
-        slot_k: ``[n_pools, pool_size, head_dim]`` bf16 — raw per-token K.
-        slot_score: ``[n_pools, pool_size, head_dim]`` — per-token gate score.
+        slot_k: BF16 pools ``[N, pool_size, head_dim]`` or raw tokens ``[N, head_dim]``.
+        slot_score: Per-token gates with the same shape as slot_k.
         ape: ``[pool_size, head_dim]`` fp32 — per-slot position bias.
-        loc: ``[n_pools]`` int64 — flat physical slot per pool.
+        loc: INT32/INT64 physical slots. Raw tokens need valid slots only at
+            pool completions, with negative slots elsewhere.
         pool_size: Number of tokens compressed into one cache entry.
         head_dim: Indexer head dimension.
         write_mask: ``[n_pools]`` bool — pools to write, or None for all.
-        round_scale: Round each fp8 scale down to a power of two.
+        round_scale: Round each fp8 scale up to a power of two.
         return_compressed: Also return the compressed K and scales.
         write_cache: Write the compressed result into ``kv_cache``.
 
     """
-    assert slot_k.ndim == 3
+    assert slot_k.ndim in (2, 3)
+    prefill_tokens = slot_k.ndim == 2
+    assert not prefill_tokens or (write_cache and not return_compressed)
+    assert prefill_tokens or slot_k.shape[1] == pool_size
     assert slot_score.shape == slot_k.shape
-    assert ape.shape == slot_k.shape[1:]
-    assert slot_k.shape[2] == head_dim
+    assert ape.shape == (pool_size, head_dim)
+    assert slot_k.shape[-1] == head_dim
     assert slot_k.dtype == torch.bfloat16
     assert ape.dtype == torch.float32
     assert kv_cache.dtype == torch.uint8
-    assert loc.dtype == torch.int64
+    assert loc.dtype in (torch.int32, torch.int64)
     assert write_cache or return_compressed
 
     page_size = kv_cache.shape[1]
@@ -363,13 +372,14 @@ def kpool_compress_and_write_cache(
         compressed_k,
         compressed_scale,
         slot_k.stride(0),
-        slot_k.stride(1),
+        slot_k.stride(0) if prefill_tokens else slot_k.stride(1),
         slot_score.stride(0),
-        slot_score.stride(1),
+        slot_score.stride(0) if prefill_tokens else slot_score.stride(1),
         ape.stride(0),
         PAGE_SIZE=page_size,
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
-        POOL_SIZE=slot_k.shape[1],
+        POOL_SIZE=pool_size,
+        PREFILL_TOKENS=prefill_tokens,
         HEAD_DIM=head_dim,
         S_OFFSET_NBYTES_IN_PAGE=s_offset_nbytes_in_page,
         # MX scales need power-of-two scales.
