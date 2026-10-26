@@ -9,23 +9,24 @@ attention remain unchanged.
 Set `VLLM_GLM5NEXT_USE_CUDNN_KPOOL=1`. The default is `0`.
 
 This route requires CuTe DSL **4.8.0** and cuDNN Frontend develop at
-`50950b2aa2cf38b1f73278e74e45f16144e7ecea` with the pooled DSA additions.
+`6fcc0aa59107d9ff690f30934ab936a9ad01a3b9` with the pooled DSA additions.
 The additions are in [cuDNN Frontend PR #1847](https://github.com/NVIDIA/cudnn-frontend/pull/1847).
 Install the pinned source in your vLLM environment:
 
 ```bash
 git clone --branch feat/pooled-dsa-blackwell https://github.com/Anerudhan/cudnn-frontend.git
-git -C cudnn-frontend checkout 55605dc6e53313366f757a274d7ce1d6468a3e74
+git -C cudnn-frontend checkout dfd51c2f645746219aa7c102b2471f62c2038b85
 uv pip install "nvidia-cutlass-dsl==4.8.0" -e ./cudnn-frontend
 ```
 
 The build needs CUDA and cuDNN headers/libraries; see the
 [frontend build guide](https://github.com/Anerudhan/cudnn-frontend/tree/feat/pooled-dsa-blackwell#building-from-source).
 
-The required internal entry is
-`cudnn.deepseek_sparse_attention.pooled.forward._compile_pooled_select`.
-It is not supplied by an unmodified frontend release. An eligible call
-raises an error if these additions are missing.
+The adapter calls the public `cudnn.ops.dsa.pooled_select_forward` API.
+It uses `cudnn.ops.dsa.pooled_select_workspace_size` to reserve caller-owned
+UINT8 scratch through vLLM's workspace manager. These additions are not
+supplied by an unmodified frontend release. An eligible call raises an error
+if they are missing.
 
 Eligibility:
 
@@ -44,6 +45,22 @@ Selected score values match exact top-k; tied IDs and ordering may differ.
 Short rows can place valid tokens and padding in different output columns.
 The tuned 8192–32768-pool variants use 32 bytes of selector scratch. K-gather
 and logits storage are additional workspace.
+
+The API validates dtypes, shapes, strides, alignment, and buffer overlap.
+With output and workspace supplied, it allocates no device storage, performs
+no host read of device values, and launches on vLLM's current stream.
+Kernel compilation stays inside cuDNN Frontend. The adapter does not call
+private frontend helpers.
+
+The other pooled DSA APIs have different scopes:
+
+| API under `cudnn.ops.dsa` | Scope | Used by this adapter |
+| --- | --- | --- |
+| `pooled_select_forward` | Logits to selected token IDs, including tails and padding | Yes |
+| `pooled_select_workspace_size` | Host query for selector scratch bytes | Yes |
+| `pooled_indexer_forward` | Paged scoring plus selection/expansion | No; scoring stays in DeepGEMM |
+| `pooled_cache_update_forward` | Gated pooling, rotation, quantization, cache writes | No; cache writes stay in vLLM Triton |
+| `pooled_expand_forward` | Expand already-selected pool IDs | No; expansion is fused into selection |
 
 ## Prefill cache writes
 
@@ -65,23 +82,13 @@ The paired GB200 measurements cover batches 1/64, prefill chunks
 projection/quantization and final sparse attention are outside the timer.
 Native BF16 cache and MXFP4 insertion are unsupported in this entry point.
 
-The measured kernel chain wins all 30 comparable cases in both run orders:
-1.05–1.60× in CUDA graph time. This is an indexer microbenchmark, not an
-end-to-end GLM-5.3-Flash result.
-
 GLM-5.3-Flash serving checks cover TP=4, FP8 weights/cache, 128 output tokens,
 4K/16K inputs at concurrency 1/8, and 32K inputs at concurrency 1 on GB200 and
 GB300. Both variants use matched MoE tuning configurations. Time requests
 before profiling, and run both execution orders with fresh server processes.
 
-The GB200 repeat has two server starts per variant and six client repeats per
-case. Combined median output throughput improves 2.5–9.6%; the separate
-execution-order comparisons range from 0.7% to 17.0%. Server-start variation
-limits the speedup claim. With GPU-local CPU affinity on a second GB200 node,
-throughput improves 1.3–2.4% in one execution order. At 16K/concurrency 8,
-TTFT still rises 7.0%. A same-server control records 9.7–16.5% higher one-token
-request latency after profiling on GB200.
-
-Smoke prompts return the expected first answers, but token log-probabilities
-differ. Full model quality is not established. The adapter uses an internal
-frontend API and remains experimental and disabled by default.
+Pin CPU placement for matched server runs and report each run order as well
+as the combined median. Indexer speedup does not establish serving speedup.
+Check output tokens and score values; tied pool IDs may change model
+log-probabilities. Smoke prompts do not establish full model quality.
+The adapter remains experimental and disabled by default.
