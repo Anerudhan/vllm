@@ -77,8 +77,10 @@ before profiling, and run both execution orders with fresh server processes.
 The GB200 repeat has two server starts per variant and six client repeats per
 case. Combined median output throughput improves 2.5–9.6%; the separate
 execution-order comparisons range from 0.7% to 17.0%. Server-start variation
-limits the speedup claim. A same-server control shows that profiling raises
-later one-token request latency by 9.7–16.5% on GB200.
+limits the speedup claim. With GPU-local CPU affinity on a second GB200 node,
+throughput improves 1.3–2.4% in one execution order. At 16K/concurrency 8,
+TTFT still rises 7.0%. A same-server control records 9.7–16.5% higher one-token
+request latency after profiling on GB200.
 
 Smoke prompts return the expected first answers, but token log-probabilities
 differ. Full model quality is not established. The adapter uses an internal
