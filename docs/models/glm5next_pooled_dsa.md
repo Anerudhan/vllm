@@ -41,6 +41,7 @@ The fused selector reads native BF16 logits, selects complete causal pools,
 and writes individual token IDs plus incomplete-pool tails. Decode and
 prefill use separate CuTe entry points. BF16 scores are not converted to FP32.
 Selected score values match exact top-k; tied IDs and ordering may differ.
+Short rows can place valid tokens and padding in different output columns.
 The tuned 8192–32768-pool variants use 32 bytes of selector scratch. K-gather
 and logits storage are additional workspace.
 
@@ -70,11 +71,15 @@ end-to-end GLM-5.3-Flash result.
 
 GLM-5.3-Flash serving checks cover TP=4, FP8 weights/cache, 128 output tokens,
 4K/16K inputs at concurrency 1/8, and 32K inputs at concurrency 1 on GB200 and
-GB300. Matched MoE tuning
-configurations are used for both variants. Median output throughput improves
-1.5–3.0% on GB300 and falls 0.1–3.9% on GB200. These results do not support
-enabling the route by default.
+GB300. Both variants use matched MoE tuning configurations. Time requests
+before profiling, and run both execution orders with fresh server processes.
 
-Expected first answers match in eight prompt checks, but one 32-token
-continuation differs. Full model quality is not established. The adapter uses
-an internal frontend API and remains experimental.
+The GB200 repeat has two server starts per variant and six client repeats per
+case. Combined median output throughput improves 2.5–9.6%; the separate
+execution-order comparisons range from 0.7% to 17.0%. Server-start variation
+limits the speedup claim. A same-server control shows that profiling raises
+later one-token request latency by 9.7–16.5% on GB200.
+
+Smoke prompts return the expected first answers, but token log-probabilities
+differ. Full model quality is not established. The adapter uses an internal
+frontend API and remains experimental and disabled by default.
