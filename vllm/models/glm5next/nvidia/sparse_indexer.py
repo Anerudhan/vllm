@@ -54,10 +54,6 @@ if current_platform.is_cuda_alike():
 logger = init_logger(__name__)
 
 
-# kpool write helper: form pools from the current token batch and compress them
-# into the index K cache via the fused Triton kernel.
-
-
 def _kpool_compress_insert(
     k: torch.Tensor,
     gate_score: torch.Tensor,
@@ -68,39 +64,21 @@ def _kpool_compress_insert(
     head_dim: int,
     round_scale: bool,
 ) -> None:
-    """Pool ``kpool`` consecutive tokens into one fp8 K and write at pool slots.
+    """Write complete pools directly from raw K and gates.
 
-    ``slot_mapping`` is pool-granular (compress_ratio == kpool on the spec):
-    only the *last* token of each complete pool carries a valid (>=0) slot;
-    intra-pool tokens are -1. Every position is treated as a pool-completion
-    candidate and non-completions are masked off inside the kernel. Compacting
-    the valid rows first costs two device syncs on the eager prefill path and
-    buys nothing numerically. Assumes pool-aligned chunk starts.
+    Valid slots mark pool completions. Requests must start at pool boundaries.
     """
-    n = slot_mapping.shape[0]
-    # No pool can complete in a batch smaller than one pool; also keeps the
-    # clamped gather indices below in bounds.
-    if n < kpool:
+    if slot_mapping.shape[0] < kpool:
         return
-    pos = torch.arange(n, device=k.device)
-    valid = slot_mapping >= 0
-    # Drop pools whose start falls before the batch (leading padding); their
-    # gate/k data is undefined anyway.
-    write_mask = valid & (pos >= kpool - 1)
-    offs = torch.arange(kpool, device=k.device)
-    idx = (pos - (kpool - 1)).clamp_min(0)[:, None] + offs[None, :]
     kpool_ops.kpool_compress_and_write_cache(
         kv_cache,
-        k[idx],  # [n, kpool, head_dim]
-        gate_score[idx],
+        k,
+        gate_score,
         ape,
-        slot_mapping.to(torch.int64),
+        slot_mapping,
         pool_size=kpool,
         head_dim=head_dim,
-        write_mask=write_mask,
         round_scale=round_scale,
-        write_cache=True,
-        return_compressed=False,
     )
 
 
@@ -209,6 +187,19 @@ def sparse_attn_indexer_kpool(
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     num_tokens = slot_mapping.shape[0]
+    use_cudnn_selection = (
+        envs.VLLM_GLM5NEXT_USE_CUDNN_KPOOL
+        and topk_backend == "auto"
+        and dcp_world_size == 1
+        and index_kpool in (4, 16)
+        and topk_tokens // index_kpool == 512
+        and 0 < max_pool_len <= 32768
+        and current_platform.is_cuda()
+        and current_platform.get_device_capability() in ((10, 0), (10, 3))
+    )
+    if use_cudnn_selection:
+        from vllm.models.glm5next.nvidia.ops.pooled_select import pooled_select
+
     if k is not None:
         k = k[:num_tokens]
 
@@ -363,17 +354,32 @@ def sparse_attn_indexer_kpool(
                 )
                 # Compressed: row i starts at K position cu_seqlen_ks[i].
                 row_ends = cu_seqlen_ke - cu_seqlen_ks
-                logits = as_fp32_logits(
-                    fp8_fp4_mqa_logits(
-                        (q_slice_cast, q_scale_slice),
-                        (k_quant_cast, k_scale_cast),
-                        chunk_weights,
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                        chunk.max_seqlen_k,
-                    ),
-                    row_ends,
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    chunk_weights,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    chunk.max_seqlen_k,
                 )
+            if (
+                use_cudnn_selection
+                and row_shard is None
+                and positions is not None
+                and logits.shape[1] > 0
+            ):
+                pooled_select(
+                    logits,
+                    positions[row_start:row_end],
+                    topk_indices_buffer[row_start:row_end],
+                    index_kpool,
+                    topk_tokens // index_kpool,
+                    max_pool_len,
+                    "prefill",
+                )
+                continue
+            if logits.dtype != torch.float32:
+                logits = as_fp32_logits(logits, row_ends)
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -614,19 +620,33 @@ def sparse_attn_indexer_kpool(
             padded_q_quant_cast, padded_q_scale, padded_weights[:num_padded_tokens]
         )
         # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_pool_len,
-                indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
+        logits = fp8_fp4_paged_mqa_logits(
+            (padded_q_quant_cast, padded_q_scale),
+            kv_cache,
+            decode_weights,
+            seq_lens,
+            decode_metadata.block_table,
+            decode_metadata.schedule_metadata,
+            max_model_len=max_pool_len,
+            indices=decode_metadata.indices,
         )
+        if (
+            use_cudnn_selection
+            and not decode_metadata.requires_padding
+            and positions is not None
+        ):
+            pooled_select(
+                logits,
+                positions[:num_padded_tokens],
+                topk_indices_buffer[:num_padded_tokens],
+                index_kpool,
+                topk_tokens // index_kpool,
+                max_pool_len,
+                "decode",
+            )
+            return topk_indices_buffer
+        logits = as_fp32_logits(logits, seq_lens.view(-1))
+
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.

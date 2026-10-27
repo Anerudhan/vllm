@@ -53,6 +53,82 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 
 
+@pytest.mark.parametrize("pool_size", [4, 16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("size", ["empty", "one", "short", "pool", "tail", "many"])
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="Raw-input pooling is NVIDIA-only."
+)
+def test_prefill_raw_tokens_match_gathered_pools(pool_size, index_dtype, strided, size):
+    """Direct inputs preserve all cache bytes and guards across graph replay."""
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+        kpool_compress_and_write_cache as write,
+    )
+
+    rows = {
+        "empty": 0,
+        "one": 1,
+        "short": pool_size - 1,
+        "pool": pool_size,
+        "tail": pool_size + 1,
+        "many": 1024,
+    }[size]
+    torch.manual_seed(73)
+    keys = torch.randn(
+        max(rows, pool_size),
+        256 if strided else 128,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )[:, :128]
+    gates = torch.randn_like(keys)
+    ape = torch.randn(pool_size, 128, device="cuda")
+    slots = torch.full((rows,), -1, device="cuda", dtype=index_dtype)
+    ends = torch.arange(
+        pool_size - 1, max(pool_size - 1, rows), pool_size, device="cuda"
+    )
+    slots[ends] = torch.randperm(256, device="cuda")[: ends.numel()].to(index_dtype)
+    if rows:
+        slots[0] = 255
+    row = torch.arange(rows, device="cuda")
+    indices = (row - pool_size + 1).clamp_min(0)[:, None] + torch.arange(
+        pool_size, device="cuda"
+    )
+    mask = (slots >= 0) & (row >= pool_size - 1)
+    pitch = 64 * 132 + 256
+    original = torch.randint(0, 256, (4, pitch), device="cuda", dtype=torch.uint8)
+    expected, actual = original.clone(), original.clone()
+
+    def cache(storage):
+        return storage.as_strided((4, 64, 132), (pitch, 132, 1))
+
+    def run():
+        write(cache(actual), keys[:rows], gates[:rows], ape, slots, pool_size)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for replay in range(2):
+        if replay:
+            keys.normal_()
+            gates.normal_()
+            ape.normal_()
+        expected.copy_(original)
+        actual.copy_(original)
+        write(
+            cache(expected),
+            keys[indices],
+            gates[indices],
+            ape,
+            slots.long(),
+            pool_size,
+            write_mask=mask,
+        )
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _make_caches():
     kv = torch.zeros(
         NUM_BLOCKS, PAGE_SIZE, HEAD_DIM + 4, dtype=torch.uint8, device="cuda"
