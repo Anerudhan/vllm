@@ -72,6 +72,21 @@ Tail seeding remains separate. This change does not require the cuDNN opt-in.
 
 ## Benchmark
 
+The measured cuDNN improvement comes from `pooled_select_forward`: fused
+selection/expansion and direct BF16 logit input. This branch also removes
+temporary K/gate gathers from prefill cache writes. Against upstream main
+`70d67f19dcf822b97b5f8863b7590edd73a59b23`, the combined changes improve
+median GLM-5.3-Flash output-token throughput by 1.5–3.2% on GB200 and
+1.0–2.7% on GB300 across the workloads below. No selector-only E2E ablation
+was measured. See [PR #1847](https://github.com/NVIDIA/cudnn-frontend/pull/1847)
+for the measurement scope and output checks.
+
+**The standalone frontend scorer is not yet performant.** At 4,096 queries
+and 32,768 pools, the full frontend indexer takes 10.7–11.7× as long as
+DeepGEMM plus the same selector on GB200/GB300. This adapter therefore keeps
+DeepGEMM scoring. The frontend scorer and cache-update API contribute no
+part of the serving gains above.
+
 `benchmarks/kernels/benchmark_glm5next_kpool.py` measures `forward_native` in
 eager mode and with `--graph`. It checks causal selection, distinct pools,
 tails, and sampled scores before timing. Set the environment variable before
